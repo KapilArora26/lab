@@ -1,0 +1,14 @@
+---
+description: PII and data-boundary rules for signal-service
+alwaysApply: true
+---
+
+# Data safety
+
+- No PII in prompts, logs, eval fixtures, or case memory. Memory stores case ids and summaries only.
+- Redact ticket and review text before it leaves the warehouse boundary. Run `signal_service.safety.redaction.assert_redacted` on every row.
+- Reject rows that still contain an email address, phone number, payment card number, government id, or UPI id. Count them as `rejected_pii` and do not send them to the Grok API.
+- Evidence snippets must be a short substring of the already-redacted text (max 140 characters).
+- Warehouse access for Sentinel and Diagnostician is read-only except for the `signals` tables this service owns.
+- The Snowflake adapter may create or write objects only inside `MCP_DB.SIGNAL_SANDBOX`. It must refuse `DROP`, `ALTER`, `TRUNCATE`, `GRANT`, and any statement that touches another schema.
+- Do not put secrets in source, commits, or pull request text. Document the env var name and nothing else.

@@ -1,0 +1,12 @@
+---
+description: Test and eval requirements for signal-service
+alwaysApply: true
+---
+
+# Testing
+
+- Every module ships unit tests. Detection, scoring, slicing, ranking, redaction, cost control, narration, and the warehouse adapters must be testable without a network.
+- The ticket classifier ships a golden-set eval of at least 50 labeled examples. CI runs `python -m signal_service.cli eval`. The fallback classifier must meet the thresholds in `signal_service.eval.harness` (topic accuracy at least 0.85).
+- CI uses a mocked Grok client. Tests must pass when `XAI_API_KEY` and `SNOWFLAKE_PAT_TOKEN` are unset.
+- Do not weaken an assertion to make a run green. Fix the detector, the scorer, or the data.
+- A change to a rule, taxonomy, or prompt requires the golden eval to be re-run and the score reported in the pull request.
