@@ -1,0 +1,156 @@
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+from signal_service.config import load_settings
+from signal_service.demo.generate import build_demo
+from signal_service.eval.harness import run_eval
+from signal_service.grok.client import LiveGrokClient, MockGrokClient
+from signal_service.orchestration.pipeline import _guard, run_pipeline
+from signal_service.warehouse.duckdb import DuckDBWarehouse
+
+
+def _client(settings):
+    import os
+
+    key = os.environ.get("XAI_API_KEY", "")
+    guard = _guard(settings)
+    if key:
+        return LiveGrokClient(
+            key,
+            guard,
+            model=settings.grok_model,
+            timeout=settings.grok_timeout_seconds,
+            max_retries=settings.grok_max_retries,
+            voice_id=settings.voice_id,
+        )
+    return MockGrokClient(guard)
+
+
+def _json_default(value):
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    raise TypeError(type(value))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="signal-service")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    generate = sub.add_parser("generate", help="Write the demo DuckDB warehouse")
+    generate.add_argument("--out", default="data/warehouse/demo.duckdb")
+
+    demo = sub.add_parser("run-demo", help="Run detection, diagnosis, signals, and the brief")
+    demo.add_argument("--db", default="data/warehouse/demo.duckdb")
+    demo.add_argument("--out", default="artifacts/demo-run.json")
+    demo.add_argument("--rebuild", action="store_true")
+
+    sub.add_parser("eval", help="Score the fallback classifier on the golden set")
+
+    serve = sub.add_parser("serve", help="Serve the HTTP API")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument("--db", default="data/warehouse/demo.duckdb")
+
+    args = parser.parse_args(argv)
+    settings = load_settings()
+
+    if args.command == "generate":
+        path = build_demo(args.out)
+        print(path)
+        return 0
+
+    if args.command == "eval":
+        report = run_eval()
+        print(json.dumps(report, indent=2))
+        return 0 if report["passed"] else 1
+
+    if args.command == "run-demo":
+        db_path = Path(args.db)
+        if args.rebuild or not db_path.exists():
+            build_demo(db_path)
+        warehouse = DuckDBWarehouse(db_path)
+        try:
+            result = run_pipeline(warehouse, _client(settings), settings, simulate_build_approval=True)
+        finally:
+            warehouse.close()
+        evaluation = run_eval()
+        result["eval"] = evaluation
+        result["verify_pr"] = {
+            "merge": False,
+            "eval_topic_accuracy": evaluation["accuracy"]["topic"],
+            "eval_threshold": evaluation["topic_threshold"],
+            "schema_diff": "signals.ticket_topics, signals.external_events, signals.spend_log",
+            "cost_estimate_usd": result["spend"]["live_estimate_usd"]["total_usd"],
+            "note": "tests_passed is reported by CI. This command does not mark tests as passed.",
+        }
+        destination = Path(args.out)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(json.dumps(result, indent=2, default=_json_default), encoding="utf-8")
+        markdown = Path(str(destination).replace(".json", ".md"))
+        markdown.write_text(_render(result), encoding="utf-8")
+        print(markdown)
+        return 0 if evaluation["passed"] and "case_card" in result else 1
+
+    if args.command == "serve":
+        import uvicorn
+
+        from signal_service.api.app import create_app
+
+        db_path = Path(args.db)
+        if not db_path.exists():
+            build_demo(db_path)
+        warehouse = DuckDBWarehouse(db_path)
+        uvicorn.run(create_app(warehouse), host=args.host, port=args.port)
+        return 0
+
+    return 2
+
+
+def _render(result: dict) -> str:
+    sections = ["# Demo run", ""]
+    if "case_card" not in result:
+        sections.append("No case was opened.")
+        sections.append("")
+        sections.append("```json")
+        sections.append(json.dumps({key: result.get(key) for key in ("error", "alerts")}, indent=2))
+        sections.append("```")
+        return "\n".join(sections) + "\n"
+    sections.append("## Case Card")
+    sections.append("")
+    sections.append("```json")
+    sections.append(json.dumps(result["case_card"], indent=2))
+    sections.append("```")
+    sections.append("")
+    sections.append("## Diagnosis before signals")
+    sections.append("")
+    sections.append("```json")
+    sections.append(json.dumps(result["diagnosis_before_signals"], indent=2))
+    sections.append("```")
+    sections.append("")
+    sections.append("## Diagnosis Pack")
+    pack = {
+        "hypotheses": result["diagnosis_pack"]["hypotheses"],
+        "capability_gap": result["diagnosis_pack"]["capability_gap"],
+        "external_signals": result["diagnosis_pack"]["external_signals"],
+        "evidence": result["diagnosis_pack"]["evidence"],
+    }
+    sections.append("")
+    sections.append("```json")
+    sections.append(json.dumps(pack, indent=2))
+    sections.append("```")
+    sections.append("")
+    sections.append("## Brief")
+    sections.append("")
+    sections.append(result["brief"]["markdown"])
+    sections.append("## Voice script")
+    sections.append("")
+    sections.append(result["brief"]["voice_script"])
+    sections.append("")
+    return "\n".join(sections)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
