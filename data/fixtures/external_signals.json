@@ -1,0 +1,29 @@
+[
+  {
+    "title": "UPI gateway degraded after OTP",
+    "summary": "A public status post reports elevated UPI failures after OTP verification, starting shortly after 02:00 UTC on 20 Nov 2026.",
+    "source_url": "https://status.example-payments.test/incidents/upi-otp-2026-11-20",
+    "source_type": "web",
+    "relevance": 0.86,
+    "observed_at": "2026-11-20T02:10:00Z",
+    "supports": ["upi", "payment", "gateway"]
+  },
+  {
+    "title": "Public complaints: Android UPI checkout failing in India",
+    "summary": "Public posts describe Android checkout failing at the UPI OTP step for shoppers in India.",
+    "source_url": "https://x.example.test/search/upi-android-otp-in",
+    "source_type": "x",
+    "relevance": 0.74,
+    "observed_at": "2026-11-20T02:40:00Z",
+    "supports": ["upi", "payment", "android"]
+  },
+  {
+    "title": "Unsourced rumor about a pricing change",
+    "summary": "This fixture item has no source and must be dropped.",
+    "source_url": "",
+    "source_type": "web",
+    "relevance": 0.99,
+    "observed_at": "2026-11-20T02:50:00Z",
+    "supports": ["upi"]
+  }
+]

@@ -1,0 +1,70 @@
+{"id": "g001", "text": "UPI payment failed after OTP on Android checkout. The order was not placed.", "topic": "upi_payment_failure", "sentiment": "negative", "severity": "high", "product_area": "payments"}
+{"id": "g002", "text": "Stuck on the UPI OTP step. Payment failed and the cart is still open.", "topic": "upi_payment_failure", "sentiment": "negative", "severity": "high", "product_area": "payments"}
+{"id": "g003", "text": "Tried twice: UPI payment failed after OTP. Please check the gateway.", "topic": "upi_payment_failure", "sentiment": "negative", "severity": "high", "product_area": "payments"}
+{"id": "g004", "text": "Android app: UPI payment failed after the OTP screen and nothing was debited.", "topic": "upi_payment_failure", "sentiment": "negative", "severity": "high", "product_area": "payments"}
+{"id": "g005", "text": "UPI failure at OTP. I could not complete the purchase.", "topic": "upi_payment_failure", "sentiment": "negative", "severity": "high", "product_area": "payments"}
+{"id": "g006", "text": "The UPI payment failed once the OTP arrived. Order still pending.", "topic": "upi_payment_failure", "sentiment": "negative", "severity": "high", "product_area": "payments"}
+{"id": "g007", "text": "UPI declined after OTP. Checkout did not finish.", "topic": "upi_payment_failure", "sentiment": "negative", "severity": "high", "product_area": "payments"}
+{"id": "g008", "text": "My card was declined at the last step. CVV was accepted and then rejected.", "topic": "card_decline", "sentiment": "negative", "severity": "high", "product_area": "payments"}
+{"id": "g009", "text": "Card declined with insufficient funds even though the balance is fine.", "topic": "card_decline", "sentiment": "negative", "severity": "high", "product_area": "payments"}
+{"id": "g010", "text": "The card was declined again. I did not mistype the CVV.", "topic": "card_decline", "sentiment": "negative", "severity": "high", "product_area": "payments"}
+{"id": "g011", "text": "Card declined. Bank text says insufficient funds, which is wrong.", "topic": "card_decline", "sentiment": "negative", "severity": "high", "product_area": "payments"}
+{"id": "g012", "text": "Visa card was declined before the order id appeared.", "topic": "card_decline", "sentiment": "negative", "severity": "high", "product_area": "payments"}
+{"id": "g013", "text": "Second try: card declined, CVV screen shook and closed.", "topic": "card_decline", "sentiment": "negative", "severity": "high", "product_area": "payments"}
+{"id": "g014", "text": "Card was declined on a saved card that worked yesterday.", "topic": "card_decline", "sentiment": "negative", "severity": "high", "product_area": "payments"}
+{"id": "g015", "text": "I want a refund. The parcel contents were not what I bought.", "topic": "refund_request", "sentiment": "negative", "severity": "medium", "product_area": "payments"}
+{"id": "g016", "text": "Please start a refund. I was charged twice for one order.", "topic": "refund_request", "sentiment": "negative", "severity": "medium", "product_area": "payments"}
+{"id": "g017", "text": "Money back request: the duplicate charge is still on my statement.", "topic": "refund_request", "sentiment": "negative", "severity": "medium", "product_area": "payments"}
+{"id": "g018", "text": "Refund has been pending for a week. Charged twice on Monday.", "topic": "refund_request", "sentiment": "negative", "severity": "medium", "product_area": "payments"}
+{"id": "g019", "text": "Can someone refund the second payment? I was charged twice.", "topic": "refund_request", "sentiment": "negative", "severity": "medium", "product_area": "payments"}
+{"id": "g020", "text": "Requesting money back because the size was wrong and I already returned it.", "topic": "refund_request", "sentiment": "negative", "severity": "medium", "product_area": "payments"}
+{"id": "g021", "text": "The refund form will not submit. I need the money back.", "topic": "refund_request", "sentiment": "negative", "severity": "medium", "product_area": "payments"}
+{"id": "g022", "text": "I cannot log in. The password reset mail never arrives.", "topic": "login_issue", "sentiment": "negative", "severity": "medium", "product_area": "account"}
+{"id": "g023", "text": "Login spins forever. I can sign in on the website but not the app.", "topic": "login_issue", "sentiment": "negative", "severity": "medium", "product_area": "account"}
+{"id": "g024", "text": "Password rejected even after a reset. Cannot log in.", "topic": "login_issue", "sentiment": "negative", "severity": "medium", "product_area": "account"}
+{"id": "g025", "text": "Sign in fails with an unknown error on the account screen.", "topic": "login_issue", "sentiment": "negative", "severity": "medium", "product_area": "account"}
+{"id": "g026", "text": "Login loop: I enter the password and land back on the form.", "topic": "login_issue", "sentiment": "negative", "severity": "medium", "product_area": "account"}
+{"id": "g027", "text": "Cannot log in since last night. Password is definitely correct.", "topic": "login_issue", "sentiment": "negative", "severity": "medium", "product_area": "account"}
+{"id": "g028", "text": "Please help me log in. The sign in button does nothing.", "topic": "login_issue", "sentiment": "negative", "severity": "medium", "product_area": "account"}
+{"id": "g029", "text": "Shipping has not moved. Tracking has been idle for six days.", "topic": "shipping_delay", "sentiment": "negative", "severity": "medium", "product_area": "shipping"}
+{"id": "g030", "text": "Where is the delivery? It has not arrived and tracking stopped.", "topic": "shipping_delay", "sentiment": "negative", "severity": "medium", "product_area": "shipping"}
+{"id": "g031", "text": "The package hasn't arrived. Shipping label was created four days ago.", "topic": "shipping_delay", "sentiment": "negative", "severity": "medium", "product_area": "shipping"}
+{"id": "g032", "text": "Tracking says in transit but there is no delivery scan.", "topic": "shipping_delay", "sentiment": "negative", "severity": "medium", "product_area": "shipping"}
+{"id": "g033", "text": "Late delivery. The shipping estimate changed twice.", "topic": "shipping_delay", "sentiment": "negative", "severity": "medium", "product_area": "shipping"}
+{"id": "g034", "text": "Order not arrived. Tracking number looks unused.", "topic": "shipping_delay", "sentiment": "negative", "severity": "medium", "product_area": "shipping"}
+{"id": "g035", "text": "Still waiting on delivery. No shipping update this week.", "topic": "shipping_delay", "sentiment": "negative", "severity": "medium", "product_area": "shipping"}
+{"id": "g036", "text": "The coupon field says the promo code is invalid.", "topic": "promo_confusion", "sentiment": "neutral", "severity": "low", "product_area": "checkout"}
+{"id": "g037", "text": "Discount code from the banner is rejected at the coupon box.", "topic": "promo_confusion", "sentiment": "neutral", "severity": "low", "product_area": "checkout"}
+{"id": "g038", "text": "Voucher will not apply. The promo code looks unused.", "topic": "promo_confusion", "sentiment": "neutral", "severity": "low", "product_area": "checkout"}
+{"id": "g039", "text": "I copied the coupon and the promo code box stays red.", "topic": "promo_confusion", "sentiment": "neutral", "severity": "low", "product_area": "checkout"}
+{"id": "g040", "text": "Which voucher works? The discount code on the homepage fails.", "topic": "promo_confusion", "sentiment": "neutral", "severity": "low", "product_area": "checkout"}
+{"id": "g041", "text": "Promo code NEW10 is not recognized in the coupon field.", "topic": "promo_confusion", "sentiment": "neutral", "severity": "low", "product_area": "checkout"}
+{"id": "g042", "text": "The voucher balance did not change when I entered the discount code.", "topic": "promo_confusion", "sentiment": "neutral", "severity": "low", "product_area": "checkout"}
+{"id": "g043", "text": "The item arrived damaged. Product quality is not acceptable.", "topic": "product_quality", "sentiment": "negative", "severity": "medium", "product_area": "catalog"}
+{"id": "g044", "text": "Defective unit. The broken item was cracked out of the box.", "topic": "product_quality", "sentiment": "negative", "severity": "medium", "product_area": "catalog"}
+{"id": "g045", "text": "Product quality issue: stitching came apart on day one.", "topic": "product_quality", "sentiment": "negative", "severity": "medium", "product_area": "catalog"}
+{"id": "g046", "text": "Received a damaged product. Please advise on the defective piece.", "topic": "product_quality", "sentiment": "negative", "severity": "medium", "product_area": "catalog"}
+{"id": "g047", "text": "Broken item, missing a part. This is a product quality complaint.", "topic": "product_quality", "sentiment": "negative", "severity": "medium", "product_area": "catalog"}
+{"id": "g048", "text": "The mug is defective and chipped. Poor product quality.", "topic": "product_quality", "sentiment": "negative", "severity": "medium", "product_area": "catalog"}
+{"id": "g049", "text": "Damaged corner and a cracked screen. Defective on arrival.", "topic": "product_quality", "sentiment": "negative", "severity": "medium", "product_area": "catalog"}
+{"id": "g050", "text": "Checkout button does nothing. I cannot place order.", "topic": "checkout_bug", "sentiment": "negative", "severity": "medium", "product_area": "checkout"}
+{"id": "g051", "text": "Cart stuck on the review page. Pay button is disabled.", "topic": "checkout_bug", "sentiment": "negative", "severity": "medium", "product_area": "checkout"}
+{"id": "g052", "text": "I tap place order and checkout reloads with an empty message.", "topic": "checkout_bug", "sentiment": "negative", "severity": "medium", "product_area": "checkout"}
+{"id": "g053", "text": "The pay button spins and checkout never confirms.", "topic": "checkout_bug", "sentiment": "negative", "severity": "medium", "product_area": "checkout"}
+{"id": "g054", "text": "Checkout shows a blank total and the pay button is missing.", "topic": "checkout_bug", "sentiment": "negative", "severity": "medium", "product_area": "checkout"}
+{"id": "g055", "text": "Cart stuck after I edit the address. Cannot place order.", "topic": "checkout_bug", "sentiment": "negative", "severity": "medium", "product_area": "checkout"}
+{"id": "g056", "text": "Place order is greyed out. Checkout will not proceed.", "topic": "checkout_bug", "sentiment": "negative", "severity": "medium", "product_area": "checkout"}
+{"id": "g057", "text": "Love the new packaging, the item looks perfect.", "topic": "other", "sentiment": "positive", "severity": "low", "product_area": "other"}
+{"id": "g058", "text": "Thanks, the app feels faster this week.", "topic": "other", "sentiment": "positive", "severity": "low", "product_area": "other"}
+{"id": "g059", "text": "Great photos on the product page.", "topic": "other", "sentiment": "positive", "severity": "low", "product_area": "other"}
+{"id": "g060", "text": "The colors look wonderful and the price is fair.", "topic": "other", "sentiment": "positive", "severity": "low", "product_area": "other"}
+{"id": "g061", "text": "Where can I see the size guide?", "topic": "other", "sentiment": "neutral", "severity": "low", "product_area": "other"}
+{"id": "g062", "text": "Do you stock this style in blue?", "topic": "other", "sentiment": "neutral", "severity": "low", "product_area": "other"}
+{"id": "g063", "text": "The collect request never completed once the one-time code was entered.", "topic": "upi_payment_failure", "sentiment": "negative", "severity": "high", "product_area": "payments"}
+{"id": "g064", "text": "BHIM timed out and the purchase did not go through on my phone.", "topic": "upi_payment_failure", "sentiment": "negative", "severity": "high", "product_area": "payments"}
+{"id": "g065", "text": "The banking app showed an error at the last step and the rupees stayed put.", "topic": "upi_payment_failure", "sentiment": "negative", "severity": "high", "product_area": "payments"}
+{"id": "g066", "text": "Two tries on the handset, the collect request expired before an order existed.", "topic": "upi_payment_failure", "sentiment": "negative", "severity": "high", "product_area": "payments"}
+{"id": "g067", "text": "Android handset in India, the transfer never confirmed after the numeric code.", "topic": "upi_payment_failure", "sentiment": "negative", "severity": "high", "product_area": "payments"}
+{"id": "g068", "text": "Nothing was debited but the screen said the transfer could not finish.", "topic": "upi_payment_failure", "sentiment": "negative", "severity": "high", "product_area": "payments"}
+{"id": "g069", "text": "The in-app sheet closed itself after I typed the six digit code.", "topic": "upi_payment_failure", "sentiment": "negative", "severity": "high", "product_area": "payments"}
+{"id": "g070", "text": "My purchase is missing even though I approved the request in the banking app.", "topic": "upi_payment_failure", "sentiment": "negative", "severity": "high", "product_area": "payments"}
