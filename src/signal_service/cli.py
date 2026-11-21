@@ -6,10 +6,12 @@ from pathlib import Path
 
 from signal_service.config import load_settings
 from signal_service.demo.generate import build_demo
+from signal_service.demo.snowflake_deploy import deploy_sandbox
 from signal_service.eval.harness import run_eval
 from signal_service.grok.client import LiveGrokClient, MockGrokClient
 from signal_service.orchestration.pipeline import _guard, run_pipeline
 from signal_service.warehouse.duckdb import DuckDBWarehouse
+from signal_service.warehouse.snowflake import SnowflakeIPBlocked, SnowflakeWarehouse, token_source
 
 
 def _client(settings):
@@ -46,6 +48,9 @@ def main(argv: list[str] | None = None) -> int:
     demo.add_argument("--db", default="data/warehouse/demo.duckdb")
     demo.add_argument("--out", default="artifacts/demo-run.json")
     demo.add_argument("--rebuild", action="store_true")
+    demo.add_argument("--backend", choices=("duckdb", "snowflake"), default="duckdb")
+
+    sub.add_parser("deploy-snowflake", help="Create MCP_DB.SIGNAL_SANDBOX and load the demo dataset")
 
     sub.add_parser("eval", help="Score the fallback classifier on the golden set")
 
@@ -67,32 +72,25 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, indent=2))
         return 0 if report["passed"] else 1
 
+    if args.command == "deploy-snowflake":
+        return _deploy_snowflake()
+
     if args.command == "run-demo":
-        db_path = Path(args.db)
-        if args.rebuild or not db_path.exists():
-            build_demo(db_path)
-        warehouse = DuckDBWarehouse(db_path)
+        if args.backend == "snowflake":
+            warehouse = SnowflakeWarehouse()
+        else:
+            db_path = Path(args.db)
+            if args.rebuild or not db_path.exists():
+                build_demo(db_path)
+            warehouse = DuckDBWarehouse(db_path)
         try:
             result = run_pipeline(warehouse, _client(settings), settings, simulate_build_approval=True)
+        except SnowflakeIPBlocked as exc:
+            _report_ip_block(exc)
+            return 2
         finally:
             warehouse.close()
-        evaluation = run_eval()
-        result["eval"] = evaluation
-        result["verify_pr"] = {
-            "merge": False,
-            "eval_topic_accuracy": evaluation["accuracy"]["topic"],
-            "eval_threshold": evaluation["topic_threshold"],
-            "schema_diff": "signals.ticket_topics, signals.external_events, signals.spend_log",
-            "cost_estimate_usd": result["spend"]["live_estimate_usd"]["total_usd"],
-            "note": "tests_passed is reported by CI. This command does not mark tests as passed.",
-        }
-        destination = Path(args.out)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(json.dumps(result, indent=2, default=_json_default), encoding="utf-8")
-        markdown = Path(str(destination).replace(".json", ".md"))
-        markdown.write_text(_render(result), encoding="utf-8")
-        print(markdown)
-        return 0 if evaluation["passed"] and "case_card" in result else 1
+        return _write_demo(result, Path(args.out))
 
     if args.command == "serve":
         import uvicorn
@@ -107,6 +105,62 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     return 2
+
+
+def _deploy_snowflake() -> int:
+    warehouse = SnowflakeWarehouse()
+    if not warehouse.token:
+        print("SNOWFLAKE_PAT_TOKEN is not set")
+        _print_public_ip()
+        return 2
+    try:
+        report = deploy_sandbox(warehouse)
+    except SnowflakeIPBlocked as exc:
+        _report_ip_block(exc)
+        return 2
+    finally:
+        warehouse.close()
+    report["token_source"] = token_source()
+    print(json.dumps(report, indent=2))
+    return 0
+
+
+def _report_ip_block(exc: SnowflakeIPBlocked) -> None:
+    print("Snowflake rejected the connection from this host.")
+    _print_public_ip()
+    print(str(exc)[:300])
+
+
+def _print_public_ip() -> None:
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen("https://api.ipify.org", timeout=15) as response:
+            address = response.read().decode("utf-8").strip()
+    except Exception:
+        address = "unavailable"
+    print(f"public_ip={address}")
+
+
+def _write_demo(result: dict, destination: Path) -> int:
+    evaluation = run_eval()
+    result["eval"] = evaluation
+    result["verify_pr"] = {
+        "merge": False,
+        "eval_topic_accuracy": evaluation["accuracy"]["topic"],
+        "eval_threshold": evaluation["topic_threshold"],
+        "schema_diff": "signals.ticket_topics, signals.external_events, signals.spend_log",
+        "cost_estimate_usd": result["spend"]["live_estimate_usd"]["total_usd"],
+        "note": "tests_passed is reported by CI. This command does not mark tests as passed.",
+    }
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(result, indent=2, default=_json_default), encoding="utf-8")
+    markdown = Path(str(destination).replace(".json", ".md"))
+    markdown.write_text(_render(result), encoding="utf-8")
+    print(markdown)
+    if "case_card" not in result:
+        return 1
+    return 0 if evaluation["passed"] else 1
 
 
 def _render(result: dict) -> str:

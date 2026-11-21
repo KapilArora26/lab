@@ -1,9 +1,10 @@
 """Optional Snowflake adapter.
 
 Talks to a Snowflake-managed MCP server over JSON-RPC. The token is read from
-SNOWFLAKE_PAT_TOKEN and sent as a bearer programmatic access token. Writes are
-limited to MCP_DB.SIGNAL_SANDBOX. This module does not open a connection at
-import time and does nothing when the token is absent.
+SNOWFLAKE_PAT_TOKEN, or from SNOWFLAKE_PAT when that name is the one injected
+into the environment. Writes are limited to MCP_DB.SIGNAL_SANDBOX. This module
+does not open a connection at import time and does nothing when the token is
+absent.
 """
 
 from __future__ import annotations
@@ -11,6 +12,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
+from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -22,26 +25,227 @@ _FORBIDDEN = re.compile(
     r"\b(drop|alter|truncate|undrop|grant|revoke|merge|call|copy|put|get|remove)\b",
     re.IGNORECASE,
 )
-_DOTTED = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\b")
+_STRING = re.compile(r"'(?:''|[^'])*'")
+_CHAIN = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)+")
+_TABLE_REF = re.compile(
+    r"(?i)\b(from|join|into|update|table(?:\s+if\s+not\s+exists)?)\s+([A-Za-z_][A-Za-z0-9_]*)\b(?!\s*\.)"
+)
+_BANNED_QUALIFIERS = {"PUBLIC", "INFORMATION_SCHEMA", "SIGNALS", "MCP"}
+_KNOWN_TABLES = {
+    "GROUPS",
+    "SESSIONS",
+    "PAYMENTS",
+    "ORDERS",
+    "SUPPORT_TICKETS",
+    "DEPLOYS",
+    "DEMO_META",
+    "GOLDEN_TICKETS",
+    "TICKET_TOPICS",
+    "EXTERNAL_EVENTS",
+    "SPEND_LOG",
+    "MEMORY_CASES",
+    "MEMORY_CALENDAR",
+    "MEMORY_CAPABILITIES",
+    "MEMORY_PREFERENCES",
+    "MEMORY_LESSONS",
+}
+_RETRY_STATUS = {429, 502, 503, 504}
 
 
 class UnsafeSQL(ValueError):
     """The statement is outside the sandbox or is not the kind of SQL requested."""
 
 
+class SnowflakeIPBlocked(RuntimeError):
+    """Snowflake rejected the call because of a network policy."""
+
+
+def _mask_strings(sql: str) -> str:
+    return _STRING.sub("''", sql)
+
+
 def _strip(sql: str) -> str:
-    without_block = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
-    without_line = re.sub(r"--.*?$", " ", without_block, flags=re.MULTILINE)
-    return without_line.strip().rstrip(";").strip()
+    """Drop comments that sit outside string literals, then a trailing semicolon."""
+    out: list[str] = []
+    index = 0
+    length = len(sql)
+    in_string = False
+    while index < length:
+        char = sql[index]
+        if in_string:
+            if char == "'" and index + 1 < length and sql[index + 1] == "'":
+                out.append("''")
+                index += 2
+                continue
+            out.append(char)
+            if char == "'":
+                in_string = False
+            index += 1
+            continue
+        if char == "'":
+            in_string = True
+            out.append(char)
+            index += 1
+            continue
+        if char == "-" and index + 1 < length and sql[index + 1] == "-":
+            index += 2
+            while index < length and sql[index] != "\n":
+                index += 1
+            out.append(" ")
+            continue
+        if char == "/" and index + 1 < length and sql[index + 1] == "*":
+            end = sql.find("*/", index + 2)
+            index = length if end < 0 else end + 2
+            out.append(" ")
+            continue
+        out.append(char)
+        index += 1
+    text = "".join(out).strip()
+    if text.endswith(";"):
+        text = text[:-1].strip()
+    return text
+
+
+def _literal(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, datetime):
+        stamp = value
+        if stamp.tzinfo is not None:
+            stamp = stamp.astimezone(timezone.utc).replace(tzinfo=None)
+        return f"'{stamp.strftime('%Y-%m-%d %H:%M:%S')}'::TIMESTAMP_NTZ"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value != value or value in {float("inf"), float("-inf")}:
+            raise UnsafeSQL("non-finite number")
+        return format(value, ".15g")
+    if isinstance(value, str):
+        return "'" + value.replace("'", "''") + "'"
+    raise UnsafeSQL(f"unsupported parameter type {type(value).__name__}")
+
+
+def bind_params(sql: str, params: list | None) -> str:
+    values = list(params or [])
+    if not values and "?" not in sql:
+        return sql
+    out: list[str] = []
+    index = 0
+    used = 0
+    length = len(sql)
+    in_string = False
+    while index < length:
+        char = sql[index]
+        if in_string:
+            if char == "'" and index + 1 < length and sql[index + 1] == "'":
+                out.append("''")
+                index += 2
+                continue
+            out.append(char)
+            if char == "'":
+                in_string = False
+            index += 1
+            continue
+        if char == "'":
+            in_string = True
+            out.append(char)
+            index += 1
+            continue
+        if char == "?":
+            if used >= len(values):
+                raise UnsafeSQL("not enough SQL parameters")
+            out.append(_literal(values[used]))
+            used += 1
+            index += 1
+            continue
+        out.append(char)
+        index += 1
+    if used != len(values):
+        raise UnsafeSQL("too many SQL parameters")
+    return "".join(out)
+
+
+def _rewrite_code(sql: str, replacer) -> str:
+    parts: list[str] = []
+    cursor = 0
+    for match in _STRING.finditer(sql):
+        parts.append(replacer(sql[cursor : match.start()]))
+        parts.append(match.group(0))
+        cursor = match.end()
+    parts.append(replacer(sql[cursor:]))
+    return "".join(parts)
+
+
+def rewrite_for_sandbox(sql: str, sandbox: str = SANDBOX_QUALIFIED) -> str:
+    """Map DuckDB names onto the sandbox without touching string literals."""
+
+    def replacer(code: str) -> str:
+        code = re.sub(
+            r"(?i)\bcreate\s+schema\s+if\s+not\s+exists\s+signals\b",
+            f"CREATE SCHEMA IF NOT EXISTS {sandbox}",
+            code,
+        )
+        code = re.sub(
+            r"(?i)\bsignals\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)",
+            lambda match: f"{sandbox}.{match.group(1)}",
+            code,
+        )
+
+        def qualify(match: re.Match[str]) -> str:
+            name = match.group(2)
+            if name.upper() not in _KNOWN_TABLES:
+                return match.group(0)
+            return f"{match.group(1)} {sandbox}.{name}"
+
+        return _TABLE_REF.sub(qualify, code)
+
+    return _rewrite_code(sql, replacer)
+
+
+def prepare_sql(sql: str, params: list | None = None, sandbox: str = SANDBOX_QUALIFIED) -> str:
+    return rewrite_for_sandbox(bind_params(_strip(sql), params), sandbox)
+
+
+def _chains(sql: str) -> list[list[str]]:
+    found: list[list[str]] = []
+    for match in _CHAIN.finditer(_mask_strings(sql)):
+        parts = [part.upper() for part in re.split(r"\s*\.\s*", match.group(0))]
+        found.append(parts)
+    return found
+
+
+def _chain_allowed(chain: list[str], sandbox_parts: list[str]) -> bool:
+    if chain == sandbox_parts:
+        return True
+    if len(chain) == 3 and chain[:2] == sandbox_parts:
+        return True
+    if len(chain) >= 3:
+        return False
+    if len(chain) == 2:
+        left = chain[0]
+        if left == sandbox_parts[0] or left.endswith("_DB") or left in _BANNED_QUALIFIERS:
+            return False
+        return True
+    return True
+
+
+def _assert_no_foreign_refs(sql: str, sandbox: str) -> None:
+    sandbox_parts = sandbox.upper().split(".")
+    for chain in _chains(sql):
+        if not _chain_allowed(chain, sandbox_parts):
+            raise UnsafeSQL(f"statement references {'.'.join(chain)}, outside {sandbox}")
 
 
 def assert_read_sql(sql: str) -> str:
     text = _strip(sql)
+    guarded = _mask_strings(text)
     if not text:
         raise UnsafeSQL("empty SQL")
-    if ";" in text:
+    if ";" in guarded:
         raise UnsafeSQL("multiple statements are refused")
-    if _FORBIDDEN.search(text):
+    if _FORBIDDEN.search(guarded):
         raise UnsafeSQL("statement contains a forbidden keyword")
     if not re.match(r"(?is)^(select|show|describe|desc|with)\b", text):
         raise UnsafeSQL("read path accepts SELECT, SHOW, DESCRIBE, or WITH")
@@ -50,30 +254,63 @@ def assert_read_sql(sql: str) -> str:
 
 def assert_sandbox_write(sql: str, sandbox: str = SANDBOX_QUALIFIED) -> str:
     text = _strip(sql)
+    guarded = _mask_strings(text)
     if not text:
         raise UnsafeSQL("empty SQL")
-    if ";" in text:
+    if ";" in guarded:
         raise UnsafeSQL("multiple statements are refused")
-    if _FORBIDDEN.search(text):
+    if _FORBIDDEN.search(guarded):
         raise UnsafeSQL("DROP, ALTER, and other destructive statements are refused")
     if not re.match(r"(?is)^(create|insert|update|delete)\b", text):
         raise UnsafeSQL("write path accepts CREATE, INSERT, UPDATE, or DELETE")
     upper_sandbox = sandbox.upper()
-    upper = text.upper()
+    upper = " ".join(text.upper().split())
     if re.match(r"(?is)^create\s+schema\b", text):
         expected = f"CREATE SCHEMA IF NOT EXISTS {upper_sandbox}"
-        if " ".join(upper.split()) != expected:
+        if upper != expected:
             raise UnsafeSQL(f"only {expected} is allowed")
         return text
     if upper_sandbox not in upper:
         raise UnsafeSQL(f"writes must be fully qualified to {sandbox}")
-    scrubbed = re.sub(re.escape(upper_sandbox) + r"\.[A-Z0-9_]+", "", upper)
-    scrubbed = scrubbed.replace(upper_sandbox, "")
-    for match in _DOTTED.finditer(scrubbed):
-        raise UnsafeSQL(
-            f"statement references {match.group(0)}, outside {sandbox}"
-        )
+    _assert_no_foreign_refs(text, sandbox)
     return text
+
+
+def _parse_timestamp(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1]
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", text):
+        return datetime.fromtimestamp(float(text), timezone.utc).replace(tzinfo=None)
+    text = re.sub(r"[+-]\d{2}:?\d{2}$", "", text)
+    return datetime.fromisoformat(text)
+
+
+def _coerce(value: Any, type_name: str | None, scale: int | None) -> Any:
+    if value is None or not type_name:
+        return value
+    kind = str(type_name).lower()
+    if kind.startswith("timestamp") or kind in {"date", "time"}:
+        try:
+            return _parse_timestamp(value)
+        except ValueError:
+            return value
+    if kind == "boolean":
+        if isinstance(value, bool):
+            return value
+        return str(value).lower() == "true"
+    if kind in {"real", "float", "double", "dec", "decimal"}:
+        return float(value)
+    if kind == "fixed":
+        if scale and int(scale) > 0:
+            return float(value)
+        text = str(value)
+        if "." in text:
+            return float(text)
+        return int(text)
+    return value
 
 
 def parse_sql_payload(payload: Any) -> list[dict]:
@@ -108,14 +345,60 @@ def parse_sql_payload(payload: Any) -> list[dict]:
 
 def _rows_from_result_set(result_set: dict) -> list[dict]:
     metadata = result_set.get("resultSetMetaData") or {}
-    names = [str(column.get("name", f"c{index}")) for index, column in enumerate(metadata.get("rowType") or [])]
+    columns = list(metadata.get("rowType") or [])
+    names = [str(column.get("name", f"c{index}")) for index, column in enumerate(columns)]
+    types = [column.get("type") for column in columns]
+    scales = [column.get("scale") for column in columns]
     rows: list[dict] = []
     for record in result_set.get("data") or []:
-        if names and len(names) == len(record):
-            rows.append({name.lower(): value for name, value in zip(names, record, strict=True)})
+        if names and isinstance(record, list) and len(names) == len(record):
+            coerced = {}
+            for index, (name, value) in enumerate(zip(names, record, strict=True)):
+                type_name = types[index] if index < len(types) else None
+                scale = scales[index] if index < len(scales) else None
+                coerced[name.lower()] = _coerce(value, type_name, scale)
+            rows.append(coerced)
         elif isinstance(record, dict):
             rows.append({str(key).lower(): value for key, value in record.items()})
     return rows
+
+
+def _looks_like_ip_block(message: str) -> bool:
+    text = message.lower()
+    if "ip" not in text and "network policy" not in text:
+        return False
+    markers = (
+        "not allowed",
+        "blocked",
+        "network policy",
+        "allow list",
+        "allowlist",
+        "whitelist",
+        "incoming request",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _error_text(result: dict) -> str:
+    chunks: list[str] = []
+    for block in result.get("content") or []:
+        if isinstance(block, dict) and block.get("text"):
+            chunks.append(str(block["text"]))
+    if chunks:
+        return " ".join(chunks)
+    return str(result.get("message") or "snowflake tool error")
+
+
+def token_from_env() -> str:
+    return os.environ.get("SNOWFLAKE_PAT_TOKEN") or os.environ.get("SNOWFLAKE_PAT", "")
+
+
+def token_source() -> str:
+    if os.environ.get("SNOWFLAKE_PAT_TOKEN"):
+        return "SNOWFLAKE_PAT_TOKEN"
+    if os.environ.get("SNOWFLAKE_PAT"):
+        return "SNOWFLAKE_PAT"
+    return "missing"
 
 
 class SnowflakeWarehouse:
@@ -128,9 +411,9 @@ class SnowflakeWarehouse:
         url: str | None = None,
         sandbox: str = SANDBOX_QUALIFIED,
         http: httpx.Client | None = None,
-        timeout: float = 60.0,
+        timeout: float = 180.0,
     ):
-        self.token = token if token is not None else os.environ.get("SNOWFLAKE_PAT_TOKEN", "")
+        self.token = token if token is not None else token_from_env()
         self.url = url or os.environ.get("SNOWFLAKE_MCP_URL", DEFAULT_SNOWFLAKE_MCP_URL)
         self.sandbox = sandbox
         self.timeout = timeout
@@ -139,7 +422,7 @@ class SnowflakeWarehouse:
 
     def _client(self) -> httpx.Client:
         if self._http is None:
-            self._http = httpx.Client(timeout=self.timeout)
+            self._http = httpx.Client(timeout=httpx.Timeout(self.timeout, connect=30.0))
         return self._http
 
     def _headers(self) -> dict[str, str]:
@@ -152,30 +435,97 @@ class SnowflakeWarehouse:
             "Accept": "application/json",
         }
 
-    def _call(self, tool: str, sql: str) -> list[dict]:
+    def _redact(self, message: str) -> str:
+        redacted = message
+        for name in ("SNOWFLAKE_PAT_TOKEN", "SNOWFLAKE_PAT"):
+            secret = os.environ.get(name)
+            if secret:
+                redacted = redacted.replace(secret, "[redacted]")
+        if self.token:
+            redacted = redacted.replace(self.token, "[redacted]")
+        return _mask_strings(redacted)
+
+    def _fail(self, message: str) -> None:
+        safe = self._redact(message)[:800]
+        if _looks_like_ip_block(safe):
+            raise SnowflakeIPBlocked(safe)
+        raise RuntimeError(f"snowflake mcp error: {safe}")
+
+    def _post(self, tool: str, sql: str) -> dict:
         body = {
             "jsonrpc": "2.0",
             "id": str(uuid4()),
             "method": "tools/call",
             "params": {"name": tool, "arguments": {"sql": sql}},
         }
-        response = self._client().post(self.url, headers=self._headers(), json=body)
-        response.raise_for_status()
-        payload = response.json()
-        if isinstance(payload, dict) and payload.get("error"):
-            message = payload["error"].get("message", payload["error"])
-            raise RuntimeError(f"snowflake mcp error: {message}")
+        delay = 1.0
+        last_status = None
+        for attempt in range(3):
+            try:
+                response = self._client().post(self.url, headers=self._headers(), json=body)
+            except httpx.TransportError:
+                if attempt == 2:
+                    self._fail("snowflake mcp request failed after retries")
+                time.sleep(delay)
+                delay *= 2
+                continue
+            last_status = response.status_code
+            if response.status_code in _RETRY_STATUS and attempt < 2:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            text = response.text[:2000]
+            if _looks_like_ip_block(text):
+                self._fail(text)
+            try:
+                payload = response.json()
+            except json.JSONDecodeError:
+                self._fail(f"http {response.status_code} non-json response")
+            if response.status_code >= 400:
+                message = ""
+                if isinstance(payload, dict) and payload.get("error"):
+                    err = payload["error"]
+                    message = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                self._fail(message or f"http {response.status_code}")
+            return payload if isinstance(payload, dict) else {}
+        self._fail(f"snowflake mcp http {last_status} after retries")
+        return {}
+
+    def _call(self, tool: str, sql: str) -> list[dict]:
+        payload = self._post(tool, sql)
+        if payload.get("error"):
+            err = payload["error"]
+            message = err.get("message", err) if isinstance(err, dict) else err
+            self._fail(str(message))
+        result = payload.get("result")
+        if isinstance(result, dict) and result.get("isError"):
+            self._fail(_error_text(result))
         return parse_sql_payload(payload)
 
     def query(self, sql: str, params: list | None = None) -> list[dict]:
-        if params:
-            raise UnsafeSQL("the Snowflake adapter does not bind parameters; pass literal SQL")
-        return self._call("sql_read_tool", assert_read_sql(sql))
+        statement = prepare_sql(sql, params, self.sandbox)
+        return self._call("sql_read_tool", assert_read_sql(statement))
 
     def execute(self, sql: str, params: list | None = None) -> None:
-        if params:
-            raise UnsafeSQL("the Snowflake adapter does not bind parameters; pass literal SQL")
-        self._call("sql_write_tool", assert_sandbox_write(sql, self.sandbox))
+        statement = prepare_sql(sql, params, self.sandbox)
+        self._call("sql_write_tool", assert_sandbox_write(statement, self.sandbox))
+
+    def executemany(self, sql: str, rows: list[tuple], *, batch_size: int = 200) -> None:
+        if not rows:
+            return
+        template = rewrite_for_sandbox(_strip(sql), self.sandbox)
+        match = re.search(r"(?is)^(.*?)\bvalues\s*(\([^;]*\))\s*$", template)
+        if match is None:
+            for row in rows:
+                self.execute(sql, list(row))
+            return
+        prefix = match.group(1).rstrip() + " VALUES"
+        placeholders = match.group(2)
+        for start in range(0, len(rows), batch_size):
+            chunk = rows[start : start + batch_size]
+            values = ", ".join(bind_params(placeholders, list(row)) for row in chunk)
+            statement = f"{prefix} {values}"
+            self._call("sql_write_tool", assert_sandbox_write(statement, self.sandbox))
 
     def ensure_sandbox(self) -> None:
         self.execute(f"CREATE SCHEMA IF NOT EXISTS {self.sandbox}")
@@ -183,3 +533,4 @@ class SnowflakeWarehouse:
     def close(self) -> None:
         if self._owns_client and self._http is not None:
             self._http.close()
+            self._http = None

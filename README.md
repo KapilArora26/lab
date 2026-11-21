@@ -112,13 +112,49 @@ Snowflake is optional. The adapter in `src/signal_service/warehouse/snowflake.py
 
 | Env var | Purpose |
 | --- | --- |
-| `SNOWFLAKE_PAT_TOKEN` | Bearer programmatic access token. Required for any live call. |
+| `SNOWFLAKE_PAT_TOKEN` | Bearer programmatic access token. Required for any live call. `SNOWFLAKE_PAT` is accepted when the first name is unset. |
 | `SNOWFLAKE_MCP_URL` | Overrides the URL above. |
 | `SNOWFLAKE_SANDBOX` | Defaults to `MCP_DB.SIGNAL_SANDBOX`. |
 
-Headers are `Authorization: Bearer <token>` and `X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN`. Reads may be `SELECT`, `SHOW`, `DESCRIBE`, or `WITH`. Writes must be `CREATE`, `INSERT`, `UPDATE`, or `DELETE` fully qualified to the sandbox. `DROP`, `ALTER`, `TRUNCATE`, and any other schema are refused in code. The token was not present in the build environment, so no sandbox objects were created.
+Headers are `Authorization: Bearer <token>` and `X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN`. Reads may be `SELECT`, `SHOW`, `DESCRIBE`, or `WITH`. Writes must be `CREATE`, `INSERT`, `UPDATE`, or `DELETE` fully qualified to the sandbox. `DROP`, `ALTER`, `TRUNCATE`, and any other schema are refused in code. The adapter binds `?` placeholders and rewrites `signals.*` plus the demo table names onto the sandbox, so the same pipeline runs on either warehouse.
 
-Snowflake accounts often enforce an IP allowlist. Allowlist the host that will call the adapter. The agent that built this repo saw public IP `54.147.134.223`. That address is the build VM, not a permanent production egress.
+## Deploy to Snowflake
+
+The migration is [`sql/snowflake/001_sandbox.sql`](sql/snowflake/001_sandbox.sql). It creates only `MCP_DB.SIGNAL_SANDBOX` and, inside that schema, the demo tables, the signal tables, the Atlas memory tables, and three views. `sessions`, `payments`, and `orders` are views over `groups`. They expand each group with `ARRAY_GENERATE_RANGE`, which is the same 0-based range the DuckDB generator materializes.
+
+```bash
+python -m signal_service.cli deploy-snowflake
+python -m signal_service.cli run-demo --backend snowflake --out artifacts/snowflake-run.json
+```
+
+`deploy-snowflake` runs the migration, deletes rows in the sandbox tables, and loads groups, support tickets, deploys, demo meta, and the 70-row golden set. It then checks that the views expand to the same session, payment, and order counts as the generator. `run-demo --backend snowflake` runs detection, diagnosis, ticket classification, external signals, and the brief against that warehouse. Without `XAI_API_KEY` it uses the mock client, same as the DuckDB demo.
+
+A run from this environment (public IP `13.219.159.123`) matched the local DuckDB demo: case `C-2026-1120-001`, Android checkout conversion in India, and H1 “Payment gateway failures on UPI” at confidence 0.80 (0.8018 before the brief rounds it). The case card, both diagnosis packs, the signal counts (73 classified, 3 rejected), the brief, and the voice script were the same.
+
+Objects left in `MCP_DB.SIGNAL_SANDBOX` after that run:
+
+| Object | Kind | Rows |
+| --- | --- | --- |
+| `GROUPS` | table | 2,960 |
+| `SUPPORT_TICKETS` | table | 92 |
+| `DEPLOYS` | table | 3 |
+| `DEMO_META` | table | 6 |
+| `GOLDEN_TICKETS` | table | 70 |
+| `SESSIONS` | view | 429,200 |
+| `PAYMENTS` | view | 51,800 |
+| `ORDERS` | view | 42,692 |
+| `TICKET_TOPICS` | table | 73 |
+| `EXTERNAL_EVENTS` | table | 2 |
+| `SPEND_LOG` | table | 0 |
+| `MEMORY_CASES` | table | 3 |
+| `MEMORY_CALENDAR` | table | 2 |
+| `MEMORY_CAPABILITIES` | table | 3 |
+| `MEMORY_PREFERENCES` | table | 3 |
+| `MEMORY_LESSONS` | table | 0 |
+
+`SPEND_LOG` stays empty because this path records spend on the case file. `MEMORY_LESSONS` stays empty until a person records an outcome. The mock run recorded $0. The live-call estimate for the same batch is about $0.14.
+
+Snowflake accounts often enforce an IP allowlist. `13.219.159.123` is the cloud agent that loaded this sandbox, not a permanent production egress. Allowlist the host that will call the adapter. An earlier build VM saw `54.147.134.223`.
 
 ## Deploy
 
@@ -176,7 +212,7 @@ Human gates, which the code will not skip:
 | `SIGNAL_MIN_VOLUME` | `100` | Minimum sessions in an hour. |
 | `SIGNAL_MIN_CONSECUTIVE` | `2` | Hours the drop must persist. |
 | `SIGNAL_DUCKDB_PATH` | `data/warehouse/demo.duckdb` | Warehouse file for the API. |
-| `SNOWFLAKE_PAT_TOKEN` | unset | Snowflake MCP token. |
+| `SNOWFLAKE_PAT_TOKEN` | unset | Snowflake MCP token. `SNOWFLAKE_PAT` is the fallback name. |
 | `SNOWFLAKE_MCP_URL` | the MCP URL above | Snowflake MCP endpoint. |
 | `SNOWFLAKE_SANDBOX` | `MCP_DB.SIGNAL_SANDBOX` | Only schema writes may touch. |
 

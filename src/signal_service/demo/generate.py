@@ -73,29 +73,7 @@ def _hours() -> list[datetime]:
     return hours
 
 
-def build_demo(path: str | Path) -> Path:
-    destination = Path(path)
-    if destination.exists():
-        destination.unlink()
-    warehouse = DuckDBWarehouse(destination)
-    connection = warehouse.connection
-    connection.execute(
-        """
-        CREATE TABLE groups (
-            group_id VARCHAR,
-            hour TIMESTAMP,
-            platform VARCHAR,
-            country VARCHAR,
-            channel VARCHAR,
-            payment_method VARCHAR,
-            sku VARCHAR,
-            app_version VARCHAR,
-            n_sessions INTEGER,
-            n_convert INTEGER,
-            n_attempt INTEGER
-        )
-        """
-    )
+def group_rows() -> list[tuple]:
     rows = []
     for hour in _hours():
         for index, segment in enumerate(SEGMENTS):
@@ -119,7 +97,130 @@ def build_demo(path: str | Path) -> Path:
                     n_attempt,
                 )
             )
-    connection.executemany("INSERT INTO groups VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+    return rows
+
+
+def ticket_rows() -> list[tuple]:
+    tickets: list[tuple] = []
+    ticket_number = 1
+    for hour in _hours():
+        if hour < ANOMALY_START or hour >= END:
+            continue
+        for offset in range(12):
+            text = UPI_TEXTS[(ticket_number + offset) % len(UPI_TEXTS)]
+            tickets.append(
+                (
+                    f"t-{ticket_number:05d}",
+                    hour,
+                    "android",
+                    "IN",
+                    "app" if offset % 2 == 0 else "paid",
+                    "upi",
+                    "SKU-100" if offset % 2 == 0 else "SKU-200",
+                    "4.2.1",
+                    "unspecified",
+                    text,
+                )
+            )
+            ticket_number += 1
+        if hour == ANOMALY_START:
+            for text in PII_TEXTS:
+                tickets.append(
+                    (
+                        f"t-{ticket_number:05d}",
+                        hour,
+                        "android",
+                        "IN",
+                        "app",
+                        "upi",
+                        "SKU-100",
+                        "4.2.1",
+                        "unspecified",
+                        text,
+                    )
+                )
+                ticket_number += 1
+            for text, platform, country, payment, version in OTHER_TEXTS:
+                tickets.append(
+                    (
+                        f"t-{ticket_number:05d}",
+                        hour,
+                        platform,
+                        country,
+                        "app",
+                        payment,
+                        "SKU-100",
+                        version,
+                        "unspecified",
+                        text,
+                    )
+                )
+                ticket_number += 1
+    baseline = START
+    while baseline < ANOMALY_START:
+        text, platform, country, payment, version = OTHER_TEXTS[baseline.day % len(OTHER_TEXTS)]
+        tickets.append(
+            (
+                f"t-{ticket_number:05d}",
+                baseline.replace(hour=15),
+                platform,
+                country,
+                "app",
+                payment,
+                "SKU-100",
+                version,
+                "unspecified",
+                text,
+            )
+        )
+        ticket_number += 1
+        baseline += timedelta(days=1)
+    return tickets
+
+
+def deploy_rows() -> list[tuple]:
+    return [
+        ("d-410", datetime(2026, 11, 1, 9, 0, 0), "android", "4.1.0", "previous stable"),
+        ("d-421", datetime(2026, 11, 20, 1, 40, 0), "android", "4.2.1", "full rollout"),
+        ("d-502", datetime(2026, 11, 12, 11, 0, 0), "ios", "5.0.2", "full rollout"),
+    ]
+
+
+def meta_rows() -> list[tuple]:
+    return [
+        ("session_weight", str(SESSION_WEIGHT)),
+        ("aov_usd", str(ORDER_AMOUNT)),
+        ("anomaly_start", ANOMALY_START.isoformat() + "Z"),
+        ("seeded_segment", "android|IN"),
+        ("seeded_version", "4.2.1"),
+        ("seeded_payment_method", "upi"),
+    ]
+
+
+def build_demo(path: str | Path) -> Path:
+    destination = Path(path)
+    if destination.exists():
+        destination.unlink()
+    warehouse = DuckDBWarehouse(destination)
+    connection = warehouse.connection
+    connection.execute(
+        """
+        CREATE TABLE groups (
+            group_id VARCHAR,
+            hour TIMESTAMP,
+            platform VARCHAR,
+            country VARCHAR,
+            channel VARCHAR,
+            payment_method VARCHAR,
+            sku VARCHAR,
+            app_version VARCHAR,
+            n_sessions INTEGER,
+            n_convert INTEGER,
+            n_attempt INTEGER
+        )
+        """
+    )
+    connection.executemany("INSERT INTO groups VALUES (?,?,?,?,?,?,?,?,?,?,?)", group_rows())
     connection.execute(
         """
         CREATE TABLE sessions AS
@@ -196,84 +297,9 @@ def build_demo(path: str | Path) -> Path:
         )
         """
     )
-    tickets: list[tuple] = []
-    ticket_number = 1
-    for hour in _hours():
-        if hour < ANOMALY_START or hour >= END:
-            continue
-        for offset in range(12):
-            text = UPI_TEXTS[(ticket_number + offset) % len(UPI_TEXTS)]
-            tickets.append(
-                (
-                    f"t-{ticket_number:05d}",
-                    hour,
-                    "android",
-                    "IN",
-                    "app" if offset % 2 == 0 else "paid",
-                    "upi",
-                    "SKU-100" if offset % 2 == 0 else "SKU-200",
-                    "4.2.1",
-                    "unspecified",
-                    text,
-                )
-            )
-            ticket_number += 1
-        if hour == ANOMALY_START:
-            for text in PII_TEXTS:
-                tickets.append(
-                    (
-                        f"t-{ticket_number:05d}",
-                        hour,
-                        "android",
-                        "IN",
-                        "app",
-                        "upi",
-                        "SKU-100",
-                        "4.2.1",
-                        "unspecified",
-                        text,
-                    )
-                )
-                ticket_number += 1
-            for text, platform, country, payment, version in OTHER_TEXTS:
-                tickets.append(
-                    (
-                        f"t-{ticket_number:05d}",
-                        hour,
-                        platform,
-                        country,
-                        "app",
-                        payment,
-                        "SKU-100",
-                        version,
-                        "unspecified",
-                        text,
-                    )
-                )
-                ticket_number += 1
-    # A thin baseline of unrelated tickets so the table is not only the incident.
-    baseline = START
-    while baseline < ANOMALY_START:
-        text, platform, country, payment, version = OTHER_TEXTS[baseline.day % len(OTHER_TEXTS)]
-        tickets.append(
-            (
-                f"t-{ticket_number:05d}",
-                baseline.replace(hour=15),
-                platform,
-                country,
-                "app",
-                payment,
-                "SKU-100",
-                version,
-                "unspecified",
-                text,
-            )
-        )
-        ticket_number += 1
-        baseline += timedelta(days=1)
     connection.executemany(
         "INSERT INTO support_tickets VALUES (?,?,?,?,?,?,?,?,?,?)",
-        tickets,
+        ticket_rows(),
     )
     connection.execute(
         """
@@ -286,26 +312,9 @@ def build_demo(path: str | Path) -> Path:
         )
         """
     )
-    connection.executemany(
-        "INSERT INTO deploys VALUES (?,?,?,?,?)",
-        [
-            ("d-410", datetime(2026, 11, 1, 9, 0, 0), "android", "4.1.0", "previous stable"),
-            ("d-421", datetime(2026, 11, 20, 1, 40, 0), "android", "4.2.1", "full rollout"),
-            ("d-502", datetime(2026, 11, 12, 11, 0, 0), "ios", "5.0.2", "full rollout"),
-        ],
-    )
+    connection.executemany("INSERT INTO deploys VALUES (?,?,?,?,?)", deploy_rows())
     connection.execute("CREATE TABLE demo_meta (key VARCHAR, value VARCHAR)")
-    connection.executemany(
-        "INSERT INTO demo_meta VALUES (?, ?)",
-        [
-            ("session_weight", str(SESSION_WEIGHT)),
-            ("aov_usd", str(ORDER_AMOUNT)),
-            ("anomaly_start", ANOMALY_START.isoformat() + "Z"),
-            ("seeded_segment", "android|IN"),
-            ("seeded_version", "4.2.1"),
-            ("seeded_payment_method", "upi"),
-        ],
-    )
+    connection.executemany("INSERT INTO demo_meta VALUES (?, ?)", meta_rows())
     connection.execute("CHECKPOINT")
     warehouse.close()
     return destination

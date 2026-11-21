@@ -5,12 +5,17 @@ import json
 import httpx
 import pytest
 
+from datetime import datetime
+
+from signal_service.demo.generate import deploy_rows, group_rows, meta_rows, ticket_rows
+from signal_service.demo.snowflake_deploy import golden_rows, load_statements
 from signal_service.warehouse.snowflake import (
     SnowflakeWarehouse,
     UnsafeSQL,
     assert_read_sql,
     assert_sandbox_write,
     parse_sql_payload,
+    prepare_sql,
 )
 
 
@@ -81,3 +86,97 @@ def test_adapter_sends_pat_header_and_refuses_without_token():
     bare = SnowflakeWarehouse(token="", http=client)
     with pytest.raises(UnsafeSQL):
         bare.query("SELECT 1")
+
+
+def test_string_literals_do_not_trip_the_write_guard():
+    assert_sandbox_write(
+        "INSERT INTO MCP_DB.SIGNAL_SANDBOX.SUPPORT_TICKETS (text_redacted) "
+        "VALUES ('rupees stayed put; email jane.doe@example.com')"
+    )
+    with pytest.raises(UnsafeSQL):
+        assert_sandbox_write("DELETE FROM MCP_DB.SIGNAL_SANDBOX.GROUPS; DELETE FROM MCP_DB.SIGNAL_SANDBOX.DEPLOYS")
+
+
+def test_pipeline_sql_is_qualified_to_the_sandbox():
+    qualified = prepare_sql(
+        "SELECT count(*)::DOUBLE AS volume FROM sessions WHERE platform = ? AND ts >= ?",
+        ["android", datetime(2026, 11, 20, 2, 0, 0)],
+    )
+    assert "FROM MCP_DB.SIGNAL_SANDBOX.sessions" in qualified
+    assert "platform = 'android'" in qualified
+    assert "2026-11-20 02:00:00" in qualified
+    assert_read_sql(qualified)
+    created = prepare_sql("CREATE SCHEMA IF NOT EXISTS signals")
+    assert created == "CREATE SCHEMA IF NOT EXISTS MCP_DB.SIGNAL_SANDBOX"
+    assert_sandbox_write(created)
+    table = prepare_sql("CREATE TABLE IF NOT EXISTS signals.ticket_topics (ticket_id VARCHAR)")
+    assert "MCP_DB.SIGNAL_SANDBOX.ticket_topics" in table
+    assert_sandbox_write(table)
+    preserved = prepare_sql("SELECT 'from sessions' AS label")
+    assert preserved == "SELECT 'from sessions' AS label"
+
+
+def test_sandbox_migration_statements_stay_inside_the_schema():
+    statements = load_statements()
+    assert len(statements) >= 15
+    for statement in statements:
+        assert_sandbox_write(statement)
+        assert "MCP_DB.SIGNAL_SANDBOX" in statement.upper()
+
+
+def test_demo_rows_shared_by_duckdb_and_snowflake():
+    assert len(group_rows()) == 2960
+    assert len(ticket_rows()) == 92
+    assert len(deploy_rows()) == 3
+    assert len(meta_rows()) == 6
+    assert len(golden_rows()) == 70
+
+
+def test_result_types_are_coerced():
+    payload = {
+        "result_set": {
+            "data": [["2026-11-20 02:00:00.000", "true", "42", "1.5"]],
+            "resultSetMetaData": {
+                "rowType": [
+                    {"name": "TS", "type": "timestamp_ntz", "scale": 9},
+                    {"name": "B", "type": "boolean", "scale": 0},
+                    {"name": "N", "type": "fixed", "scale": 0},
+                    {"name": "D", "type": "real", "scale": 0},
+                ]
+            },
+        }
+    }
+    row = parse_sql_payload(payload)[0]
+    assert row["ts"] == datetime(2026, 11, 20, 2, 0, 0)
+    assert row["b"] is True
+    assert row["n"] == 42
+    assert row["d"] == 1.5
+
+
+def test_executemany_batches_bound_values():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append(body["params"]["arguments"]["sql"])
+        inner = {"result_set": {"data": [], "resultSetMetaData": {"rowType": []}}}
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": inner})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    warehouse = SnowflakeWarehouse(token="pat-test", url="https://example.test/mcp", http=client)
+    warehouse.executemany(
+        "INSERT INTO demo_meta (key, value) VALUES (?,?)",
+        [("session_weight", "15.625"), ("seeded_payment_method", "upi")],
+    )
+    assert len(seen) == 1
+    assert "INSERT INTO MCP_DB.SIGNAL_SANDBOX.demo_meta" in seen[0]
+    assert "'session_weight'" in seen[0]
+    assert "'upi'" in seen[0]
+    assert "?" not in seen[0]
+
+
+def test_pat_alias_is_used_when_the_primary_name_is_unset(monkeypatch):
+    monkeypatch.delenv("SNOWFLAKE_PAT_TOKEN", raising=False)
+    monkeypatch.setenv("SNOWFLAKE_PAT", "alias-token")
+    warehouse = SnowflakeWarehouse()
+    assert warehouse.token == "alias-token"

@@ -13,3 +13,7 @@ def repo_root() -> Path:
 
 def data_path(*parts: str) -> Path:
     return repo_root().joinpath("data", *parts)
+
+
+def sql_path(*parts: str) -> Path:
+    return repo_root().joinpath("sql", *parts)

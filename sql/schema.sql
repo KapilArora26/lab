@@ -1,6 +1,7 @@
 -- Logical signal tables. DuckDB creates these under the schema `signals`.
 -- Snowflake writes are allowed only in MCP_DB.SIGNAL_SANDBOX (see the adapter).
--- The sandbox tables are the same columns without a nested schema.
+-- The migration that creates the sandbox, demo tables, and expansion views is
+-- sql/snowflake/001_sandbox.sql.
 
 CREATE SCHEMA IF NOT EXISTS signals;
 
