@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CaseFile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "case_id",
+    "schema_version",
+    "metric",
+    "segment",
+    "delta_pct",
+    "started_at",
+    "revenue_at_risk_usd_per_hour",
+    "severity",
+    "hypotheses",
+    "capability_gap",
+    "approvals"
+  ],
+  "properties": {
+    "case_id": {"type": "string", "pattern": "^C-[0-9]{4}-[0-9]{4}-[0-9]{3}$"},
+    "schema_version": {"const": 1},
+    "metric": {"type": "string"},
+    "segment": {"type": "object", "additionalProperties": {"type": "string"}},
+    "delta_pct": {"type": "number"},
+    "started_at": {"type": "string"},
+    "revenue_at_risk_usd_per_hour": {"type": "number"},
+    "severity": {"enum": ["low", "medium", "high"]},
+    "hypotheses": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "required": ["id", "claim", "confidence", "evidence"],
+        "properties": {
+          "id": {"type": "string"},
+          "claim": {"type": "string"},
+          "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+          "evidence": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "capability_gap": {"type": ["object", "null"]},
+    "approvals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["type", "by", "status"],
+        "properties": {
+          "type": {"enum": ["build", "merge_deploy", "executive_action"]},
+          "by": {"type": "string"},
+          "status": {"enum": ["pending", "approved", "rejected", "simulated_for_demo"]},
+          "note": {"type": "string"}
+        }
+      }
+    }
+  }
+}
