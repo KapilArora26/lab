@@ -1,0 +1,12 @@
+---
+description: Pull request shape for signal-service
+alwaysApply: true
+---
+
+# PR hygiene
+
+- Keep pull requests small and scoped. Do not mix an unrelated refactor with a signal change.
+- Use the pull request template. Fill in schema diff, golden-eval results, and the cost estimate. Leave any of those sections as "none" with a reason rather than deleting them.
+- Do not merge your own pull request. Builder and the cloud agent never merge and never deploy to production.
+- Do not commit generated warehouse files, `.env`, API keys, or Snowflake tokens.
+- Schema changes are additive inside `signals` (DuckDB) or `MCP_DB.SIGNAL_SANDBOX` (Snowflake). Call out every new column in the schema diff.

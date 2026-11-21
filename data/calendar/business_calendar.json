@@ -1,0 +1,20 @@
+[
+  {
+    "id": "promo-preview-nov10",
+    "kind": "promo",
+    "start": "2026-11-10T00:00:00Z",
+    "end": "2026-11-11T00:00:00Z",
+    "metric": "checkout_conversion",
+    "segment": {},
+    "note": "Sitewide preview promo. Sentinel suppresses conversion alerts that start inside this window."
+  },
+  {
+    "id": "freeze-ios-nov18",
+    "kind": "freeze",
+    "start": "2026-11-18T00:00:00Z",
+    "end": "2026-11-18T06:00:00Z",
+    "metric": null,
+    "segment": {"platform": "ios"},
+    "note": "iOS deploy freeze. Does not cover the Android India incident on Nov 20."
+  }
+]

@@ -1,0 +1,16 @@
+---
+description: How signal-service calls the Grok API
+alwaysApply: true
+---
+
+# Grok API usage
+
+- Read the API key from the `XAI_API_KEY` environment variable. Never hardcode a key, never pass it on a command line, and never write it to logs, fixtures, or pull requests.
+- Call the documented xAI endpoints only:
+  - Structured classification: `POST https://api.x.ai/v1/chat/completions` with `response_format.type = json_schema` and a Pydantic model (`strict: true`). Default model `grok-4.7`, override with `GROK_MODEL`.
+  - Live web and X search: `POST https://api.x.ai/v1/responses` with tools `web_search` and `x_search`. Keep only items that have a source URL.
+  - Voice: `POST https://api.x.ai/v1/tts` with `text`, `voice_id`, and `language`. The body is audio bytes.
+- Validate every model payload with the Pydantic schema before it is stored or shown. Reject outputs that do not match.
+- Set a timeout (`GROK_TIMEOUT_SECONDS`, default 30) and bounded retries with exponential backoff (`GROK_MAX_RETRIES`, default 3) on timeout, connection errors, and HTTP 429/502/503/504.
+- Log model name, HTTP status, latency, input hash, and token usage. Never log prompt text, ticket text, or evidence snippets.
+- If `XAI_API_KEY` is absent, use the in-repo mock client so tests and the demo still run. Record `provider: mock` on every row produced that way.

@@ -1,0 +1,40 @@
+{
+  "case_registry": {
+    "case_id": "C-YYYY-MMDD-NNN",
+    "metric": "string",
+    "segment": {"type": "object", "additionalProperties": {"type": "string"}},
+    "status": ["investigating", "diagnosed", "briefed", "awaiting_action", "closed"],
+    "owner": "string",
+    "hypotheses": [{"id": "string", "claim": "string", "confidence": "number", "evidence": ["string"]}],
+    "outcome": {"correct": "boolean", "summary": "string"}
+  },
+  "business_calendar": {
+    "id": "string",
+    "kind": ["promo", "freeze", "holiday", "launch"],
+    "start": "date-time",
+    "end": "date-time",
+    "metric": ["string", "null"],
+    "segment": {"type": "object"},
+    "note": "string"
+  },
+  "capability_registry": {
+    "name": "string",
+    "table": ["string", "null"],
+    "eval_threshold": ["number", "null"],
+    "pull_request": ["string", "null"],
+    "last_eval_score": ["number", "null"]
+  },
+  "stakeholder_preferences": {
+    "stakeholder": "string",
+    "channel": ["chat", "voice", "page"],
+    "quiet_hours": "HH:MM-HH:MM or null",
+    "detail": ["exec", "full"]
+  },
+  "lessons": {
+    "lesson_id": "string",
+    "case_id": "string",
+    "fingerprint": "string, max 180 characters",
+    "summary": "string",
+    "raw_text": "forbidden"
+  }
+}

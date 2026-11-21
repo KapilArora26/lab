@@ -1,0 +1,12 @@
+---
+description: Batch size, spend cap, and circuit breaker
+alwaysApply: true
+---
+
+# Cost and limits
+
+- Batch size is `SIGNAL_BATCH_SIZE` (default 25). Do not send unbounded prompts.
+- Enforce `SIGNAL_DAILY_SPEND_CAP_USD` (default 25) in code before each model or TTS call. The estimate uses `GROK_INPUT_USD_PER_MILLION`, `GROK_OUTPUT_USD_PER_MILLION`, and `GROK_TTS_USD_PER_MILLION_CHARS`.
+- When the next call would exceed the cap, raise the circuit breaker, stop the job, and return a structured error. Do not keep calling the API.
+- LLM calls happen inside ticket classification, external search, and voice synthesis. Anomaly detection stays statistical and does not call the model.
+- Record estimated spend on the case file. A demo run with the mock client reports zero spend and a separate live-call estimate.

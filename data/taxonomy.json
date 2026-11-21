@@ -1,0 +1,18 @@
+{
+  "name": "support_ticket_topics",
+  "version": 1,
+  "topics": [
+    "upi_payment_failure",
+    "card_decline",
+    "checkout_bug",
+    "shipping_delay",
+    "refund_request",
+    "login_issue",
+    "product_quality",
+    "promo_confusion",
+    "other"
+  ],
+  "sentiments": ["negative", "neutral", "positive"],
+  "severities": ["low", "medium", "high"],
+  "product_areas": ["checkout", "payments", "shipping", "account", "catalog", "other"]
+}
