@@ -129,7 +129,7 @@ python -m signal_service.cli run-demo --backend snowflake --out artifacts/snowfl
 
 `deploy-snowflake` runs the migration, deletes rows in the sandbox tables, and loads groups, support tickets, deploys, demo meta, and the 70-row golden set. It then checks that the views expand to the same session, payment, and order counts as the generator. `run-demo --backend snowflake` runs detection, diagnosis, ticket classification, external signals, and the brief against that warehouse. Without `XAI_API_KEY` it uses the mock client, same as the DuckDB demo.
 
-A run from this environment (public IP `13.219.159.123`) matched the local DuckDB demo: case `C-2026-1120-001`, Android checkout conversion in India, and H1 “Payment gateway failures on UPI” at confidence 0.80 (0.8018 before the brief rounds it). The case card, both diagnosis packs, the signal counts (73 classified, 3 rejected), the brief, and the voice script were the same.
+The Snowflake run matched the local DuckDB demo: case `C-2026-1120-001`, Android checkout conversion in India, and H1 “Payment gateway failures on UPI” at confidence 0.80 (0.8018 before the brief rounds it). The case card, both diagnosis packs, the signal counts (73 classified, 3 rejected), the brief, and the voice script were the same.
 
 Objects left in `MCP_DB.SIGNAL_SANDBOX` after that run:
 
@@ -154,7 +154,7 @@ Objects left in `MCP_DB.SIGNAL_SANDBOX` after that run:
 
 `SPEND_LOG` stays empty because this path records spend on the case file. `MEMORY_LESSONS` stays empty until a person records an outcome. The mock run recorded $0. The live-call estimate for the same batch is about $0.14.
 
-Snowflake accounts often enforce an IP allowlist. `13.219.159.123` is the cloud agent that loaded this sandbox, not a permanent production egress. Allowlist the host that will call the adapter. An earlier build VM saw `54.147.134.223`.
+Snowflake accounts often enforce an IP allowlist. This cloud agent does not have one stable public address. During the load, Snowflake login history for the programmatic token recorded `3.209.66.12`, `13.219.159.123`, `3.228.178.73`, and `52.44.113.131`. `https://api.ipify.org` returned `13.219.159.123` and, on one check, `54.236.146.182`. An earlier build VM saw `54.147.134.223`. Allowlist the host that will call the adapter. None of these addresses is a permanent production egress.
 
 ## Deploy
 
