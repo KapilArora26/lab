@@ -73,7 +73,9 @@ def deploy_sandbox(warehouse: SnowflakeWarehouse, client=None) -> dict:
     installed = install_event_driven(warehouse)
     warehouse._pipeline_mode = installed
     print(f"loading the seed batch through ingest ({installed.mode})", flush=True)
-    ingested = ingest_seed(warehouse)
+    # Core DDL already ran. ingest_seed must not apply it again: a second
+    # ADD COLUMN IF NOT EXISTS ... DEFAULT fails once the column exists.
+    ingested = ingest_seed(warehouse, migrate=False)
     if ingested["status"] == "failed":
         raise RuntimeError(ingested.get("error") or "seed ingest failed")
     from signal_service.pipeline.reconcile import assert_reconciled

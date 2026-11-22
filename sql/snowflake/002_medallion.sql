@@ -304,6 +304,11 @@ CREATE TABLE IF NOT EXISTS MCP_DB.SIGNAL_SANDBOX.STREAM_BATCH_QUEUE (
     batch_id VARCHAR
 );
 
+-- Additive data-quality columns. Snowflake does not treat
+-- `ADD COLUMN IF NOT EXISTS ... DEFAULT` as idempotent: a second execution
+-- raises `SQL compilation error: ambiguous column name ''` when the column
+-- already exists. The adapter reads INFORMATION_SCHEMA.COLUMNS and skips the
+-- ALTER in that case. These statements do not DROP and do not rewrite rows.
 ALTER TABLE MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS ADD COLUMN IF NOT EXISTS dq_status VARCHAR DEFAULT 'ok';
 
 ALTER TABLE MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS ADD COLUMN IF NOT EXISTS dq_reason VARCHAR;

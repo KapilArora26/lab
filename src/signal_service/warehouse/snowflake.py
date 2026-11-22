@@ -1,10 +1,11 @@
 """Optional Snowflake adapter.
 
 Talks to a Snowflake-managed MCP server over JSON-RPC. The token is read from
-SNOWFLAKE_PAT_TOKEN, or from SNOWFLAKE_PAT when that name is the one injected
-into the environment. Writes are limited to MCP_DB.SIGNAL_SANDBOX. This module
-does not open a connection at import time and does nothing when the token is
-absent.
+SNOWFLAKE_PAT_TOKEN. SNOWFLAKE_PAT is used only when SNOWFLAKE_PAT_TOKEN is
+unset. Writes are limited to MCP_DB.SIGNAL_SANDBOX. Additive ADD COLUMN
+statements are skipped when INFORMATION_SCHEMA.COLUMNS already lists the
+column. This module does not open a connection at import time and does nothing
+when the token is absent.
 """
 
 from __future__ import annotations
@@ -82,6 +83,17 @@ _KNOWN_TABLES = {
     "STREAM_BATCH_QUEUE",
 }
 _RETRY_STATUS = {429, 502, 503, 504}
+# Snowflake compiles ADD COLUMN IF NOT EXISTS ... DEFAULT against the existing
+# column and raises "SQL compilation error: ambiguous column name ''".
+# A real ambiguous name, such as 'DQ_STATUS', must still surface.
+_EXISTING_COLUMN = re.compile(r"ambiguous column name\s+''", re.IGNORECASE)
+_ADD_COLUMN = re.compile(
+    r"(?is)^alter\s+table\s+"
+    r"(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?"
+    r"(?P<table>[A-Za-z_][A-Za-z0-9_]*)\s+"
+    r"add\s+column\s+(?:if\s+not\s+exists\s+)?"
+    r"(?P<column>[A-Za-z_][A-Za-z0-9_]*)\b"
+)
 
 
 class UnsafeSQL(ValueError):
@@ -94,6 +106,15 @@ class ResultTruncated(RuntimeError):
 
 class SnowflakeIPBlocked(RuntimeError):
     """Snowflake rejected the call because of a network policy."""
+
+
+class ColumnAlreadyExists(RuntimeError):
+    """ADD COLUMN hit Snowflake's empty-name error for a column that exists.
+
+    Raised only when the unredacted tool error is ``ambiguous column name ''``.
+    Redaction masks every quoted name to that same text, so the check has to
+    run on the raw message. Other compilation errors stay ordinary failures.
+    """
 
 
 def _mask_strings(sql: str) -> str:
@@ -614,7 +635,27 @@ def assert_result_complete(payload: Any) -> None:
             raise ResultTruncated(f"result page has {len(data)} rows and numRows is {num_rows}")
 
 
+def add_column_target(sql: str) -> tuple[str, str] | None:
+    """Return ``(table, column)`` for an additive ``ALTER TABLE ... ADD COLUMN``."""
+    match = _ADD_COLUMN.match(" ".join(sql.split()))
+    if match is None:
+        return None
+    return match.group("table"), match.group("column")
+
+
+def is_existing_column_error(message: str) -> bool:
+    """True only for Snowflake's already-exists failure on ``ADD COLUMN``.
+
+    The compiler reports an empty name when ``IF NOT EXISTS`` is combined with
+    ``DEFAULT`` and the column is already present. A real ambiguous name such
+    as ``'DQ_STATUS'`` does not match. Call this with the raw tool text.
+    Redaction turns every quoted identifier into ``''``.
+    """
+    return _EXISTING_COLUMN.search(message) is not None
+
+
 def token_from_env() -> str:
+    """Primary name is ``SNOWFLAKE_PAT_TOKEN``. ``SNOWFLAKE_PAT`` is the fallback."""
     return os.environ.get("SNOWFLAKE_PAT_TOKEN") or os.environ.get("SNOWFLAKE_PAT", "")
 
 
@@ -725,7 +766,10 @@ class SnowflakeWarehouse:
             self._fail(str(message))
         result = payload.get("result")
         if isinstance(result, dict) and result.get("isError"):
-            self._fail(_error_text(result))
+            message = _error_text(result)
+            if is_existing_column_error(message):
+                raise ColumnAlreadyExists(self._redact(message)[:800])
+            self._fail(message)
         return parse_sql_payload(payload)
 
     def query(self, sql: str, params: list | None = None) -> list[dict]:
@@ -734,7 +778,71 @@ class SnowflakeWarehouse:
 
     def execute(self, sql: str, params: list | None = None) -> None:
         statement = prepare_sql(sql, params, self.sandbox)
-        self._call("sql_write_tool", assert_sandbox_write(statement, self.sandbox))
+        guarded = assert_sandbox_write(statement, self.sandbox)
+        target = add_column_target(guarded)
+        if target is not None:
+            self._add_column_if_missing(guarded, target)
+            return
+        self._call("sql_write_tool", guarded)
+
+    def _add_column_if_missing(self, statement: str, target: tuple[str, str]) -> None:
+        """Skip ``ADD COLUMN`` when the sandbox catalog already lists it.
+
+        The catalog read is ``MCP_DB.INFORMATION_SCHEMA.COLUMNS`` filtered to
+        this sandbox. When that read fails, the statement is attempted once
+        and only the empty-name already-exists error is ignored.
+        """
+        table, column = target
+        if self._column_exists(table, column):
+            return
+        try:
+            self._call("sql_write_tool", statement)
+        except ColumnAlreadyExists:
+            self._remember_column(table, column)
+            return
+        self._remember_column(table, column)
+
+    def _column_exists(self, table: str, column: str) -> bool:
+        key = (table.upper(), column.upper())
+        if getattr(self, "_column_catalog_failed", False):
+            return key in getattr(self, "_column_cache", set())
+        try:
+            columns = self._sandbox_columns()
+        except SnowflakeIPBlocked:
+            raise
+        except Exception:
+            self._column_catalog_failed = True
+            return key in getattr(self, "_column_cache", set())
+        return key in columns
+
+    def _sandbox_columns(self) -> set[tuple[str, str]]:
+        cached = getattr(self, "_column_cache", None)
+        if cached is not None:
+            return cached
+        database, schema = self.sandbox.split(".")
+        rows = self.query(
+            f"""
+            SELECT table_name, column_name
+            FROM {database}.INFORMATION_SCHEMA.COLUMNS
+            WHERE table_schema = ?
+            """,
+            [schema.upper()],
+        )
+        found: set[tuple[str, str]] = set()
+        for row in rows:
+            table_name = row.get("table_name")
+            column_name = row.get("column_name")
+            if table_name and column_name:
+                found.add((str(table_name).upper(), str(column_name).upper()))
+        self._column_cache = found
+        return found
+
+    def _remember_column(self, table: str, column: str) -> None:
+        cache = getattr(self, "_column_cache", None)
+        if cache is None:
+            cache = set()
+            self._column_cache = cache
+        cache.add((table.upper(), column.upper()))
 
     def executemany(self, sql: str, rows: list[tuple], *, batch_size: int = 200) -> None:
         if not rows:

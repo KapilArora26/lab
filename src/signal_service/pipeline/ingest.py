@@ -89,8 +89,10 @@ def ingest(
     hours: int | None = None,
     mode: str | None = None,
     rerun: bool = False,
+    migrate: bool = True,
 ) -> dict:
-    ensure_objects(warehouse)
+    if migrate:
+        ensure_objects(warehouse)
     if batch == "file":
         payload = load_file_batch(path or "")
     elif batch == "new":
@@ -100,18 +102,24 @@ def ingest(
     else:
         raise ValueError("batch must be 'new', 'file', or 'seed'")
     if rerun:
-        return rerun_batch(warehouse, payload.batch_id, mode=mode)
-    return ingest_batch(warehouse, payload, mode=mode)
+        return rerun_batch(warehouse, payload.batch_id, mode=mode, migrate=migrate)
+    return ingest_batch(warehouse, payload, mode=mode, migrate=migrate)
 
 
-def ingest_seed(warehouse, *, mode: str | None = None, rerun: bool = False) -> dict:
-    ensure_objects(warehouse)
+def ingest_seed(warehouse, *, mode: str | None = None, rerun: bool = False, migrate: bool = True) -> dict:
+    """Land the seed batch.
+
+    ``migrate=False`` is the deploy path. ``deploy-snowflake`` has already
+    applied the core migration, and applying it again re-issues ``ADD COLUMN``.
+    """
+    if migrate:
+        ensure_objects(warehouse)
     if rerun:
-        return rerun_batch(warehouse, SEED_BATCH_ID, mode=mode)
-    return ingest_batch(warehouse, seed_batch(), mode=mode)
+        return rerun_batch(warehouse, SEED_BATCH_ID, mode=mode, migrate=migrate)
+    return ingest_batch(warehouse, seed_batch(), mode=mode, migrate=migrate)
 
 
-def rerun_batch(warehouse, batch_id: str, *, mode: str | None = None) -> dict:
+def rerun_batch(warehouse, batch_id: str, *, mode: str | None = None, migrate: bool = True) -> dict:
     """Reprocess one batch even when a gold run was recorded as success.
 
     Bronze rows are left in place. This does not ``DROP`` or ``TRUNCATE``.
@@ -120,7 +128,8 @@ def rerun_batch(warehouse, batch_id: str, *, mode: str | None = None) -> dict:
     truncated read. CLI: ``python -m signal_service.cli rerun <batch_id>`` or
     ``python -m signal_service.cli ingest --batch seed --rerun``.
     """
-    ensure_objects(warehouse)
+    if migrate:
+        ensure_objects(warehouse)
     if not _bronze_present(warehouse, batch_id):
         raise ValueError(f"cannot rerun {batch_id}: bronze rows are not present")
     batch = Batch(
@@ -133,11 +142,12 @@ def rerun_batch(warehouse, batch_id: str, *, mode: str | None = None) -> dict:
         golden=[],
         external=[],
     )
-    return ingest_batch(warehouse, batch, mode=mode, rerun=True)
+    return ingest_batch(warehouse, batch, mode=mode, rerun=True, migrate=migrate)
 
 
-def ingest_batch(warehouse, batch: Batch, *, mode: str | None = None, rerun: bool = False) -> dict:
-    ensure_objects(warehouse)
+def ingest_batch(warehouse, batch: Batch, *, mode: str | None = None, rerun: bool = False, migrate: bool = True) -> dict:
+    if migrate:
+        ensure_objects(warehouse)
     report = resolve_mode(warehouse, mode)
     if rerun and not _bronze_present(warehouse, batch.batch_id):
         raise ValueError(f"cannot rerun {batch.batch_id}: bronze rows are not present")
