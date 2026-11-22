@@ -13,6 +13,7 @@ from signal_service.demo.generate import (
     START,
     UPI_TEXTS,
     deploy_rows,
+    external_event_rows,
     group_rows,
     meta_rows,
     ticket_rows,
@@ -76,11 +77,19 @@ def seed_batch() -> Batch:
         deploys=deploy_rows(),
         meta=meta_rows(),
         golden=golden_rows(),
-        external=[],
+        external=external_event_rows(),
     )
 
 
-def ingest(warehouse, *, batch: str = "new", path: str | None = None, hours: int | None = None, mode: str | None = None) -> dict:
+def ingest(
+    warehouse,
+    *,
+    batch: str = "new",
+    path: str | None = None,
+    hours: int | None = None,
+    mode: str | None = None,
+    rerun: bool = False,
+) -> dict:
     ensure_objects(warehouse)
     if batch == "file":
         payload = load_file_batch(path or "")
@@ -90,18 +99,64 @@ def ingest(warehouse, *, batch: str = "new", path: str | None = None, hours: int
         payload = seed_batch()
     else:
         raise ValueError("batch must be 'new', 'file', or 'seed'")
+    if rerun:
+        return rerun_batch(warehouse, payload.batch_id, mode=mode)
     return ingest_batch(warehouse, payload, mode=mode)
 
 
-def ingest_seed(warehouse, *, mode: str | None = None) -> dict:
+def ingest_seed(warehouse, *, mode: str | None = None, rerun: bool = False) -> dict:
     ensure_objects(warehouse)
+    if rerun:
+        return rerun_batch(warehouse, SEED_BATCH_ID, mode=mode)
     return ingest_batch(warehouse, seed_batch(), mode=mode)
 
 
-def ingest_batch(warehouse, batch: Batch, *, mode: str | None = None) -> dict:
+def rerun_batch(warehouse, batch_id: str, *, mode: str | None = None) -> dict:
+    """Reprocess one batch even when a gold run was recorded as success.
+
+    Bronze rows are left in place. This does not ``DROP`` or ``TRUNCATE``.
+    Silver rejects for the batch are replaced, and ``MERGE`` inserts keys that
+    were missing. Use it when a gold success row is wrong, for example after a
+    truncated read. CLI: ``python -m signal_service.cli rerun <batch_id>`` or
+    ``python -m signal_service.cli ingest --batch seed --rerun``.
+    """
+    ensure_objects(warehouse)
+    if not _bronze_present(warehouse, batch_id):
+        raise ValueError(f"cannot rerun {batch_id}: bronze rows are not present")
+    batch = Batch(
+        batch_id=batch_id,
+        source="rerun",
+        groups=[],
+        tickets=[],
+        deploys=[],
+        meta=[],
+        golden=[],
+        external=[],
+    )
+    return ingest_batch(warehouse, batch, mode=mode, rerun=True)
+
+
+def ingest_batch(warehouse, batch: Batch, *, mode: str | None = None, rerun: bool = False) -> dict:
     ensure_objects(warehouse)
     report = resolve_mode(warehouse, mode)
-    if _gold_succeeded(warehouse, batch.batch_id):
+    if rerun and not _bronze_present(warehouse, batch.batch_id):
+        raise ValueError(f"cannot rerun {batch.batch_id}: bronze rows are not present")
+    if not rerun and _gold_succeeded(warehouse, batch.batch_id):
+        from signal_service.pipeline.reconcile import reconciliation_errors
+
+        problems = reconciliation_errors(warehouse, batch.batch_id)
+        if problems:
+            return {
+                "batch_id": batch.batch_id,
+                "mode": report.mode,
+                "propagation": "noop",
+                "status": "failed",
+                "noop": False,
+                "error": "; ".join(problems),
+                "missing_privileges": report.missing_privileges,
+                "notes": report.notes,
+                "layers": _layers(warehouse, batch.batch_id),
+            }
         return {
             "batch_id": batch.batch_id,
             "mode": report.mode,
@@ -135,11 +190,15 @@ def ingest_batch(warehouse, batch: Batch, *, mode: str | None = None) -> dict:
             status="success",
             rows_in=batch.row_count(),
             rows_out=landed,
+            rows_rejected=0,
         )
     propagation = "sync"
     error = None
     status = "success"
-    if report.mode == "procedure" and report.procedure_ready:
+    if getattr(warehouse, "backend", "duckdb") == "snowflake":
+        propagation = "procedure"
+        status, error = _load_staging(warehouse, batch.batch_id, report, rerun)
+    elif report.mode == "procedure" and report.procedure_ready:
         propagation = "procedure"
         try:
             warehouse.execute(
@@ -156,9 +215,16 @@ def ingest_batch(warehouse, batch: Batch, *, mode: str | None = None) -> dict:
         status = "landed"
     else:
         status, error = _sync(warehouse, batch.batch_id)
+    if status == "success":
+        from signal_service.pipeline.reconcile import reconciliation_errors
+
+        problems = reconciliation_errors(warehouse, batch.batch_id)
+        if problems:
+            status = "failed"
+            error = "; ".join(problems)
     return {
         "batch_id": batch.batch_id,
-        "mode": report.mode if propagation != "sync" or report.mode == "sync" else report.mode,
+        "mode": report.mode,
         "propagation": propagation,
         "status": status,
         "noop": False,
@@ -167,6 +233,46 @@ def ingest_batch(warehouse, batch: Batch, *, mode: str | None = None) -> dict:
         "notes": report.notes,
         "layers": _layers(warehouse, batch.batch_id),
     }
+
+
+def _load_staging(warehouse, batch_id: str, report, rerun: bool) -> tuple[str, str | None]:
+    """Propagate on the server. Never SELECT bronze rows into this process."""
+    if not _ensure_procedure(warehouse, report):
+        return (
+            "failed",
+            "LOAD_STAGING is not available. Snowflake ingest does not pull bronze rows into the client.",
+        )
+    if rerun:
+        statement = "CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(?, ?)"
+        params = [batch_id, True]
+    else:
+        statement = "CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(?)"
+        params = [batch_id]
+    try:
+        warehouse.execute(statement, params)
+    except Exception as exc:
+        return "failed", str(exc)[:500]
+    from signal_service.pipeline.reconcile import latest_layer_status
+
+    failed = latest_layer_status(warehouse, batch_id)
+    if failed:
+        return "failed", failed
+    return "success", None
+
+
+def _ensure_procedure(warehouse, report) -> bool:
+    if report.procedure_ready:
+        return True
+    from signal_service.pipeline.ddl import medallion_statements
+
+    for statement in medallion_statements("procedure"):
+        try:
+            warehouse.execute(statement)
+        except Exception as exc:
+            report.notes.append(f"LOAD_STAGING was not created: {str(exc)[:200]}")
+            return False
+    report.procedure_ready = True
+    return True
 
 
 def _sync(warehouse, batch_id: str) -> tuple[str, str | None]:

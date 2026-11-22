@@ -7,9 +7,10 @@ import pytest
 
 from datetime import datetime
 
-from signal_service.demo.generate import deploy_rows, group_rows, meta_rows, ticket_rows
+from signal_service.demo.generate import deploy_rows, external_event_rows, group_rows, meta_rows, ticket_rows
 from signal_service.demo.snowflake_deploy import golden_rows, load_statements
 from signal_service.warehouse.snowflake import (
+    ResultTruncated,
     SnowflakeWarehouse,
     UnsafeSQL,
     assert_read_sql,
@@ -130,6 +131,7 @@ def test_demo_rows_shared_by_duckdb_and_snowflake():
     assert len(deploy_rows()) == 3
     assert len(meta_rows()) == 6
     assert len(golden_rows()) == 70
+    assert len(external_event_rows()) == 2
 
 
 def test_result_types_are_coerced():
@@ -173,6 +175,48 @@ def test_executemany_batches_bound_values():
     assert "'session_weight'" in seen[0]
     assert "'upi'" in seen[0]
     assert "?" not in seen[0]
+
+
+def _truncated_response(body: dict, *, status: str | None, num_rows: int, data: list) -> httpx.Response:
+    inner: dict = {
+        "result_set": {
+            "data": data,
+            "resultSetMetaData": {
+                "numRows": num_rows,
+                "rowType": [{"name": "GROUP_ID", "type": "text"}],
+            },
+        }
+    }
+    if status is not None:
+        inner["status"] = status
+    return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": inner})
+
+
+def test_truncated_read_is_refused():
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        return _truncated_response(
+            body,
+            status="Result truncated to fit tool-output budget",
+            num_rows=2960,
+            data=[["7-2026111117"]],
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    warehouse = SnowflakeWarehouse(token="pat-test", url="https://example.test/mcp", http=client)
+    with pytest.raises(ResultTruncated, match="truncated"):
+        warehouse.query("SELECT group_id FROM bronze_groups")
+
+
+def test_short_page_is_refused_when_num_rows_is_larger():
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        return _truncated_response(body, status=None, num_rows=2960, data=[["0-2026110800"]] * 2162)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    warehouse = SnowflakeWarehouse(token="pat-test", url="https://example.test/mcp", http=client)
+    with pytest.raises(ResultTruncated, match="2162"):
+        warehouse.query("SELECT group_id FROM bronze_groups")
 
 
 def test_pat_alias_is_used_when_the_primary_name_is_unset(monkeypatch):

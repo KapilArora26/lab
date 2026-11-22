@@ -18,6 +18,7 @@ from signal_service.paths import data_path
 START = datetime(2026, 11, 8, 0, 0, 0)
 END = datetime(2026, 11, 20, 8, 0, 0)
 ANOMALY_START = datetime(2026, 11, 20, 2, 0, 0)
+DEMO_CASE_ID = "C-2026-1120-001"
 ORDER_AMOUNT = 48.0
 SESSION_WEIGHT = 15.625
 
@@ -196,6 +197,35 @@ def meta_rows() -> list[tuple]:
         ("seeded_version", "4.2.1"),
         ("seeded_payment_method", "upi"),
     ]
+
+
+def external_event_rows() -> list[tuple]:
+    """The two sourced demo events. The unsourced fixture row is dropped."""
+    raw = json.loads(data_path("fixtures", "external_signals.json").read_text(encoding="utf-8"))
+    sourced = []
+    for item in raw:
+        url = str(item.get("source_url") or "").strip()
+        if url.startswith("https://") or url.startswith("http://"):
+            sourced.append(item)
+    sourced.sort(key=lambda item: float(item["relevance"]), reverse=True)
+    rows = []
+    for index, item in enumerate(sourced, start=1):
+        observed = datetime.fromisoformat(str(item["observed_at"]).replace("Z", ""))
+        rows.append(
+            (
+                f"ext-{DEMO_CASE_ID}-{index}",
+                DEMO_CASE_ID,
+                item["title"],
+                item["summary"],
+                item["source_url"],
+                item.get("source_type"),
+                float(item["relevance"]),
+                observed,
+                "checkout_conversion",
+                "mock",
+            )
+        )
+    return rows
 
 
 def golden_rows() -> list[tuple]:

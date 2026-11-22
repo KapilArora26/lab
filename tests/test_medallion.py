@@ -8,8 +8,10 @@ from datetime import datetime
 from fastapi.testclient import TestClient
 
 from signal_service.api.app import create_app
-from signal_service.pipeline.ingest import SEED_BATCH_ID, Batch, ingest, ingest_seed
+from signal_service.pipeline.ddl import medallion_statements
+from signal_service.pipeline.ingest import SEED_BATCH_ID, Batch, ingest, ingest_seed, rerun_batch
 from signal_service.pipeline.mode import ModeReport, install_event_driven
+from signal_service.pipeline.reconcile import reconciliation_errors
 from signal_service.safety.redaction import pii_kinds
 
 
@@ -247,6 +249,76 @@ def test_post_ingest_on_the_api(demo_wh):
     assert len(body["layers"]) == 3
     outside = client.post("/v1/ingest", json={"batch": "file", "path": "/etc/passwd"})
     assert outside.status_code == 400
+
+
+def test_seed_topics_external_events_and_layer_conservation(demo_wh):
+    assert reconciliation_errors(demo_wh, SEED_BATCH_ID, expect_topics=73, expect_external=2) == []
+    assert _count(demo_wh, "SELECT COUNT(*)::INTEGER AS n FROM bronze_groups") == 2960
+    assert _count(demo_wh, "SELECT COUNT(*)::INTEGER AS n FROM silver_groups") == 2960
+    assert _count(demo_wh, "SELECT COUNT(*)::INTEGER AS n FROM bronze_external_events") == 2
+    assert _count(demo_wh, "SELECT COUNT(*)::INTEGER AS n FROM silver_external_events") == 2
+    assert _count(demo_wh, "SELECT COUNT(*)::INTEGER AS n FROM gold_external_events") == 2
+    assert _count(demo_wh, "SELECT COUNT(*)::INTEGER AS n FROM signals.ticket_topics") == 73
+    assert _count(demo_wh, "SELECT COUNT(*)::INTEGER AS n FROM silver_ticket_topics") == 73
+    upi = demo_wh.query(
+        """
+        SELECT topic, ticket_count
+        FROM gold_ticket_topics
+        WHERE topic = 'upi_payment_failure'
+        """
+    )
+    assert upi and int(upi[0]["ticket_count"]) == 72
+    runs = demo_wh.query(
+        "SELECT layer, rows_in, rows_out, rows_rejected FROM pipeline_runs WHERE batch_id = ?",
+        [SEED_BATCH_ID],
+    )
+    assert {row["layer"] for row in runs} == {"bronze", "silver", "gold"}
+    for row in runs:
+        assert int(row["rows_in"]) == int(row["rows_out"]) + int(row["rows_rejected"])
+
+
+def test_rerun_keeps_bronze_and_replaces_a_false_success(demo_wh):
+    before_groups = _count(demo_wh, "SELECT COUNT(*)::INTEGER AS n FROM bronze_groups")
+    again = rerun_batch(demo_wh, SEED_BATCH_ID)
+    assert again["noop"] is False
+    assert again["status"] == "success"
+    assert _count(demo_wh, "SELECT COUNT(*)::INTEGER AS n FROM bronze_groups") == before_groups
+    assert _count(demo_wh, "SELECT COUNT(*)::INTEGER AS n FROM silver_groups") == before_groups
+    assert reconciliation_errors(demo_wh, SEED_BATCH_ID, expect_topics=73, expect_external=2) == []
+
+
+def test_task_ddl_is_a_single_load_staging_call():
+    tasks = medallion_statements("task")
+    assert len(tasks) == 2
+    for statement in tasks:
+        folded = " ".join(statement.upper().split())
+        assert "$$" not in statement
+        assert "INSERT" not in folded
+        assert " BEGIN " not in f" {folded} "
+        assert folded.count(" CALL ") == 1
+        assert "CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(NULL)" in folded
+    procedure = medallion_statements("procedure")[0].upper()
+    assert "RERUN BOOLEAN" in procedure
+    assert "SILVER_TICKET_TOPICS" in procedure
+    assert "GOLD_TICKET_TOPICS" in procedure
+    assert "BRONZE_EXTERNAL_EVENTS" in procedure
+    assert "SILVER_EXTERNAL_EVENTS" in procedure
+
+
+def test_compilation_error_is_not_a_missing_privilege():
+    class Scripted:
+        backend = "snowflake"
+
+        def execute(self, sql, params=None):
+            folded = " ".join(sql.lower().split())
+            if folded.startswith("create") and " task " in folded[:180]:
+                raise RuntimeError("SQL compilation error: syntax error line 11 at position 0 unexpected '$$'.")
+
+    report = install_event_driven(Scripted())
+    assert "CREATE TASK" not in report.missing_privileges
+    assert report.procedure_ready is True
+    assert report.tasks_ready is False
+    assert any("compilation error" in note.lower() for note in report.notes)
 
 
 def test_direct_batch_object_carries_lineage(demo_wh):
