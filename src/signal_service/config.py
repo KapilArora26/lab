@@ -46,6 +46,8 @@ class Settings:
     voice_id: str = "eve"
     snowflake_mcp_url: str = DEFAULT_SNOWFLAKE_MCP_URL
     snowflake_sandbox: str = SANDBOX_QUALIFIED
+    pipeline_mode: str = "auto"
+    ingest_hours: int = 6
 
 
 def load_settings() -> Settings:
@@ -64,4 +66,6 @@ def load_settings() -> Settings:
         voice_id=os.environ.get("GROK_VOICE_ID", "eve"),
         snowflake_mcp_url=os.environ.get("SNOWFLAKE_MCP_URL", DEFAULT_SNOWFLAKE_MCP_URL),
         snowflake_sandbox=os.environ.get("SNOWFLAKE_SANDBOX", SANDBOX_QUALIFIED),
+        pipeline_mode=os.environ.get("SIGNAL_PIPELINE_MODE", "auto"),
+        ingest_hours=_int("SIGNAL_INGEST_HOURS", 6),
     )

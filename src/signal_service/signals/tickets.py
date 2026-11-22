@@ -33,12 +33,20 @@ def run_ticket_signals(
     rows = warehouse.query(
         f"""
         SELECT ticket_id, text_redacted
-        FROM support_tickets
+        FROM bronze_support_tickets
         WHERE {' AND '.join(clauses)}
         ORDER BY ticket_id
         """,
         params,
     )
+    try:
+        already = {
+            row["ticket_id"]
+            for row in warehouse.query("SELECT ticket_id FROM signals.ticket_topics WHERE case_id = ?", [case_id])
+        }
+    except Exception:
+        already = set()
+    rows = [row for row in rows if row["ticket_id"] not in already]
     accepted = []
     rejected = 0
     for row in rows:

@@ -20,7 +20,7 @@ def count_tickets(warehouse, card: dict) -> int:
             clauses.append(f"{column} = ?")
             params.append(card["segment"][column])
     rows = warehouse.query(
-        f"SELECT count(*)::INTEGER AS n FROM support_tickets WHERE {' AND '.join(clauses)}",
+        f"SELECT count(*)::INTEGER AS n FROM silver_support_tickets WHERE {' AND '.join(clauses)}",
         params,
     )
     return int(rows[0]["n"])

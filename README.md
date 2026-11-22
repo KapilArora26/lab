@@ -75,6 +75,7 @@ HTTP:
 | --- | --- | --- |
 | GET | `/health` | Process and warehouse check |
 | POST | `/v1/pipeline/run` | Detect, diagnose, classify, brief |
+| POST | `/v1/ingest` | Land a batch in bronze and propagate it |
 | GET | `/v1/eval` | Golden-set score |
 
 ## Tests and eval
@@ -116,18 +117,62 @@ Snowflake is optional. The adapter in `src/signal_service/warehouse/snowflake.py
 | `SNOWFLAKE_MCP_URL` | Overrides the URL above. |
 | `SNOWFLAKE_SANDBOX` | Defaults to `MCP_DB.SIGNAL_SANDBOX`. |
 
-Headers are `Authorization: Bearer <token>` and `X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN`. Reads may be `SELECT`, `SHOW`, `DESCRIBE`, or `WITH`. Writes must be `CREATE`, `INSERT`, `UPDATE`, or `DELETE` fully qualified to the sandbox. `DROP`, `ALTER`, `TRUNCATE`, and any other schema are refused in code. The adapter binds `?` placeholders and rewrites `signals.*` plus the demo table names onto the sandbox, so the same pipeline runs on either warehouse.
+Headers are `Authorization: Bearer <token>` and `X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN`. Reads may be `SELECT`, `SHOW`, `DESCRIBE`, or `WITH`. Writes must be fully qualified to the sandbox. The adapter allows `CREATE` (including `STREAM`, `TASK`, `DYNAMIC TABLE`, and `PROCEDURE`), `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING`, and `ALTER TASK ... RESUME`. `DROP`, `TRUNCATE`, `GRANT`, any other `ALTER`, and any other schema are refused in code. The adapter binds `?` placeholders and rewrites `signals.*` plus the demo table names onto the sandbox, so the same pipeline runs on either warehouse.
+
+## Medallion pipeline
+
+Landing is on demand. Nothing is scheduled. `python -m signal_service.cli ingest` or `POST /v1/ingest` appends a batch to bronze. Silver and gold then update before that call returns when the warehouse is DuckDB, and on Snowflake when the role can create `LOAD_STAGING`. Streams and tasks are the automatic path for inserts that do not go through the CLI. Each layer reads only the layer before it. The dashboard reads gold.
+
+```text
+ingest (CLI or POST /v1/ingest)     on demand, never a schedule
+        |
+        v
+   BRONZE_*   raw landing, PII allowed
+              _ingested_at, _source, _batch_id
+        |
+        |  streams + tasks, or CALL LOAD_STAGING, or sync MERGE
+        v
+   SILVER_*   typed, deduplicated, redacted
+              _loaded_at, _batch_id, SILVER_REJECTS
+        |
+        v
+   GOLD_*     conversion, revenue at risk, cases, topics, spend
+              _loaded_at, _batch_id
+        |
+        +-- GOLD_PIPELINE_LAG   bronze_ingested_at, silver_loaded_at,
+        |                       gold_loaded_at, staging_to_gold_seconds
+        +-- GOLD_HEALTH
+        +-- PIPELINE_RUNS       one row per layer step
+```
+
+```bash
+python -m signal_service.cli ingest --batch new --db data/warehouse/demo.duckdb
+python -m signal_service.cli ingest --batch file data/batches/example.json
+```
+
+`--batch new` asks the generator for the next hours after the latest bronze timestamp (`SIGNAL_INGEST_HOURS`, default 6). The same `_batch_id` is a no-op. Raw PII stays in `BRONZE_SUPPORT_TICKETS`. Silver tickets are the rows that pass `assert_redacted`; the others land in `SILVER_REJECTS` with the text replaced by `[redacted]`.
+
+`SIGNAL_PIPELINE_MODE` is `auto`, `sync`, `task`, `procedure`, or `dynamic_table`. DuckDB is always `sync`. On Snowflake, `auto` creates streams, serverless tasks (`WHEN SYSTEM$STREAM_HAS_DATA`), and `MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(batch VARCHAR)` when the role allows it. The only `ALTER` in the migration is `ALTER TASK ... RESUME`, because a new task is suspended. If `CREATE STREAM`, `CREATE TASK`, `EXECUTE TASK`, or `CREATE PROCEDURE` is denied, that statement is skipped and ingest runs the MERGE itself. Dynamic tables at `TARGET_LAG = '1 minute'` are attempted only when `SIGNAL_SNOWFLAKE_WAREHOUSE` is set and tasks could not be created. The ingest response reports `mode`, `propagation`, and `missing_privileges`.
+
+A monitor reads:
+
+```sql
+SELECT * FROM MCP_DB.SIGNAL_SANDBOX.PIPELINE_RUNS ORDER BY started_at DESC;
+SELECT * FROM MCP_DB.SIGNAL_SANDBOX.GOLD_PIPELINE_LAG;
+```
+
+`deploy-snowflake` applies `sql/snowflake/001_sandbox.sql` and `sql/snowflake/002_medallion.sql`, loads the seed batch through ingest, and checks GROUPS 2,960, SESSIONS 429,200, PAYMENTS 51,800, ORDERS 42,692, SUPPORT_TICKETS 92, and TICKET_TOPICS 73.
 
 ## Deploy to Snowflake
 
-The migration is [`sql/snowflake/001_sandbox.sql`](sql/snowflake/001_sandbox.sql). It creates only `MCP_DB.SIGNAL_SANDBOX` and, inside that schema, the demo tables, the signal tables, the Atlas memory tables, and three views. `sessions`, `payments`, and `orders` are views over `groups`. They expand each group with `ARRAY_GENERATE_RANGE`, which is the same 0-based range the DuckDB generator materializes.
+The migrations are [`sql/snowflake/001_sandbox.sql`](sql/snowflake/001_sandbox.sql) and [`sql/snowflake/002_medallion.sql`](sql/snowflake/002_medallion.sql). They create only `MCP_DB.SIGNAL_SANDBOX`. `sessions`, `payments`, and `orders` are views over silver groups. They expand each group with `ARRAY_GENERATE_RANGE`, which is the same 0-based range the DuckDB generator materializes.
 
 ```bash
 python -m signal_service.cli deploy-snowflake
 python -m signal_service.cli run-demo --backend snowflake --out artifacts/snowflake-run.json
 ```
 
-`deploy-snowflake` runs the migration, deletes rows in the sandbox tables, and loads groups, support tickets, deploys, demo meta, and the 70-row golden set. It then checks that the views expand to the same session, payment, and order counts as the generator. `run-demo --backend snowflake` runs detection, diagnosis, ticket classification, external signals, and the brief against that warehouse. Without `XAI_API_KEY` it uses the mock client, same as the DuckDB demo.
+`deploy-snowflake` applies both migrations, installs streams, tasks, and `LOAD_STAGING` when the role allows, and loads the seed batch through ingest. It does not delete rows. A second deploy is a no-op for that batch id. It then checks the expansion counts and classifies the seeded incident. `run-demo --backend snowflake` runs detection, diagnosis, ticket classification, external signals, and the brief against that warehouse. Without `XAI_API_KEY` it uses the mock client, same as the DuckDB demo.
 
 The Snowflake run matched the local DuckDB demo: case `C-2026-1120-001`, Android checkout conversion in India, and H1 “Payment gateway failures on UPI” at confidence 0.80 (0.8018 before the brief rounds it). The case card, both diagnosis packs, the signal counts (73 classified, 3 rejected), the brief, and the voice script were the same.
 
@@ -215,6 +260,9 @@ Human gates, which the code will not skip:
 | `SNOWFLAKE_PAT_TOKEN` | unset | Snowflake MCP token. `SNOWFLAKE_PAT` is the fallback name. |
 | `SNOWFLAKE_MCP_URL` | the MCP URL above | Snowflake MCP endpoint. |
 | `SNOWFLAKE_SANDBOX` | `MCP_DB.SIGNAL_SANDBOX` | Only schema writes may touch. |
+| `SIGNAL_PIPELINE_MODE` | `auto` | `sync`, `task`, `procedure`, or `dynamic_table`. |
+| `SIGNAL_INGEST_HOURS` | `6` | Hours generated by `ingest --batch new`. |
+| `SIGNAL_SNOWFLAKE_WAREHOUSE` | unset | Warehouse name for the dynamic-table fallback. |
 
 ## Schema
 

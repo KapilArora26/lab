@@ -59,6 +59,12 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--port", type=int, default=8000)
     serve.add_argument("--db", default="data/warehouse/demo.duckdb")
 
+    ingest = sub.add_parser("ingest", help="Land a batch in bronze and propagate it")
+    ingest.add_argument("--batch", nargs="+", default=["new"], help="new, or: file PATH")
+    ingest.add_argument("--db", default="data/warehouse/demo.duckdb")
+    ingest.add_argument("--backend", choices=("duckdb", "snowflake"), default="duckdb")
+    ingest.add_argument("--hours", type=int, default=None)
+
     args = parser.parse_args(argv)
     settings = load_settings()
 
@@ -92,6 +98,9 @@ def main(argv: list[str] | None = None) -> int:
             warehouse.close()
         return _write_demo(result, Path(args.out))
 
+    if args.command == "ingest":
+        return _ingest(args)
+
     if args.command == "serve":
         import uvicorn
 
@@ -105,6 +114,36 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     return 2
+
+
+def _ingest(args) -> int:
+    from signal_service.pipeline.ingest import ingest
+
+    kind, path = _parse_batch(args.batch)
+    if args.backend == "snowflake":
+        warehouse = SnowflakeWarehouse()
+    else:
+        db_path = Path(args.db)
+        if not db_path.exists():
+            build_demo(db_path)
+        warehouse = DuckDBWarehouse(db_path)
+    try:
+        report = ingest(warehouse, batch=kind, path=path, hours=args.hours)
+    except SnowflakeIPBlocked as exc:
+        _report_ip_block(exc)
+        return 2
+    finally:
+        warehouse.close()
+    print(json.dumps(report, indent=2, default=_json_default))
+    return 0 if report.get("status") in {"success", "noop", "landed"} else 1
+
+
+def _parse_batch(values: list[str]) -> tuple[str, str | None]:
+    if not values or values == ["new"]:
+        return "new", None
+    if values[0] == "file" and len(values) == 2:
+        return "file", values[1]
+    raise SystemExit("usage: ingest --batch new | ingest --batch file PATH")
 
 
 def _deploy_snowflake() -> int:

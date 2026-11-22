@@ -31,7 +31,7 @@ def _rates(warehouse, dimension: str, segment: dict, start: datetime, end: datet
             SELECT {dimension} AS value,
                    count(*)::DOUBLE AS volume,
                    sum(CASE WHEN converted THEN 1 ELSE 0 END)::DOUBLE AS positives
-            FROM sessions
+            FROM silver_sessions
             WHERE {prefix} ts >= ? AND ts < ?
             GROUP BY 1
         """
@@ -42,7 +42,7 @@ def _rates(warehouse, dimension: str, segment: dict, start: datetime, end: datet
             SELECT {value_column} AS value,
                    count(*)::DOUBLE AS attempts,
                    sum(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)::DOUBLE AS fails
-            FROM payments
+            FROM silver_payments
             WHERE {prefix} ts >= ? AND ts < ?
             GROUP BY 1
         """
@@ -96,7 +96,7 @@ def slice_case(warehouse, card: dict) -> dict:
             "lift": (current_rate / base_rate) if base_rate else None,
         }
     deploys = warehouse.query(
-        "SELECT deploy_id, deployed_at, platform, app_version, note FROM deploys"
+        "SELECT deploy_id, deployed_at, platform, app_version, note FROM silver_deploys"
     )
     return {
         "dimensions": dimensions,
