@@ -515,7 +515,7 @@ DECLARE
 BEGIN
     v_batch := batch;
     v_rerun := COALESCE(rerun, FALSE);
-    v_loaded := CURRENT_TIMESTAMP();
+    v_loaded := CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ;
     v_start := v_loaded;
     v_run := UUID_STRING();
 
@@ -617,10 +617,10 @@ BEGIN
             CASE
                 WHEN group_id IS NULL THEN 'null group_id'
                 WHEN hour IS NULL THEN 'null hour'
-                WHEN n_sessions IS NULL OR n_sessions < 0 THEN 'negative n_sessions'
-                WHEN n_convert IS NULL OR n_convert < 0 THEN 'negative n_convert'
-                WHEN n_attempt IS NULL OR n_convert > n_attempt THEN 'n_convert exceeds n_attempt'
-                WHEN n_convert > n_sessions THEN 'n_convert exceeds n_sessions'
+                WHEN n_sessions IS NULL OR n_convert IS NULL OR n_attempt IS NULL THEN 'null metric'
+                WHEN n_sessions < 0 OR n_convert < 0 OR n_attempt < 0 THEN 'negative_count'
+                WHEN n_convert > n_sessions THEN 'conversions_gt_sessions'
+                WHEN n_convert > n_attempt THEN 'conversions_gt_attempts'
                 WHEN platform IS NULL OR country IS NULL THEN 'null segment'
                 WHEN rn > 1 THEN 'duplicate group_id'
                 ELSE NULL
@@ -652,6 +652,7 @@ BEGIN
               AND country IS NOT NULL
               AND n_sessions >= 0
               AND n_convert >= 0
+              AND n_attempt >= 0
               AND n_attempt >= n_convert
               AND n_sessions >= n_convert
         )
@@ -838,7 +839,7 @@ BEGIN
         COALESCE(:v_batch, 'pending'),
         'silver',
         :v_start,
-        CURRENT_TIMESTAMP(),
+        CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ,
         :v_status,
         :v_in,
         :v_out,
@@ -954,7 +955,7 @@ BEGIN
         COALESCE(:v_batch, 'pending'),
         'gold',
         :v_start,
-        CURRENT_TIMESTAMP(),
+        CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ,
         :v_status,
         :v_gold_out,
         :v_gold_out,
