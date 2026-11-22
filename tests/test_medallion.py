@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
+
+import pytest
 from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
@@ -12,7 +15,7 @@ from fastapi.testclient import TestClient
 from signal_service.api.app import create_app
 from signal_service.pipeline.ddl import medallion_statements
 from signal_service.pipeline.ingest import SEED_BATCH_ID, Batch, ingest, ingest_batch, ingest_seed, rerun_batch
-from signal_service.pipeline.mode import ModeReport, dynamic_table_sql, install_event_driven
+from signal_service.pipeline.mode import ModeReport, ProcedureCompileError, dynamic_table_sql, install_event_driven
 from signal_service.pipeline.reconcile import reconciliation_errors
 from signal_service.safety.redaction import pii_kinds
 from signal_service.warehouse.duckdb import DuckDBWarehouse
@@ -425,12 +428,63 @@ def test_task_ddl_is_a_single_load_staging_call():
         assert " BEGIN " not in f" {folded} "
         assert folded.count(" CALL ") == 1
         assert "CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(NULL)" in folded
-    procedure = medallion_statements("procedure")[0].upper()
-    assert "RERUN BOOLEAN" in procedure
-    assert "SILVER_TICKET_TOPICS" in procedure
-    assert "GOLD_TICKET_TOPICS" in procedure
-    assert "BRONZE_EXTERNAL_EVENTS" in procedure
-    assert "SILVER_EXTERNAL_EVENTS" in procedure
+    procedures = medallion_statements("procedure")
+    assert len(procedures) == 2
+    load_staging = procedures[0]
+    rerun_staging = procedures[1]
+    assert re.search(r"LOAD_STAGING\s*\(\s*batch\s+VARCHAR\s*\)", load_staging, re.IGNORECASE)
+    assert "DEFAULT" not in load_staging.split("$$", 1)[0].upper()
+    assert re.search(r"RERUN_STAGING\s*\(\s*batch\s+VARCHAR\s*\)", rerun_staging, re.IGNORECASE)
+    assert "SILVER_TICKET_TOPICS" in load_staging.upper()
+    assert "GOLD_TICKET_TOPICS" in load_staging.upper()
+    assert "BRONZE_EXTERNAL_EVENTS" in load_staging.upper()
+    assert "SILVER_EXTERNAL_EVENTS" in load_staging.upper()
+
+
+def test_migrations_keep_one_load_staging_signature_and_never_drop():
+    from signal_service.demo.snowflake_deploy import load_statements
+
+    statements = load_statements() + medallion_statements()
+    load_signatures = []
+    rerun_signatures = []
+    for statement in statements:
+        assert re.search(r"(?i)\bdrop\b", statement) is None
+        load = re.search(
+            r"(?is)create\s+(?:or\s+replace\s+)?procedure\s+[\w.]+\.LOAD_STAGING\s*\((.*?)\)",
+            statement,
+        )
+        if load:
+            load_signatures.append(" ".join(load.group(1).split()))
+            assert not re.search(r"(?i)\bdefault\b", statement.split("$$", 1)[0])
+        rerun = re.search(
+            r"(?is)create\s+(?:or\s+replace\s+)?procedure\s+[\w.]+\.RERUN_STAGING\s*\((.*?)\)",
+            statement,
+        )
+        if rerun:
+            rerun_signatures.append(" ".join(rerun.group(1).split()))
+    assert load_signatures == ["batch VARCHAR"]
+    assert rerun_signatures == ["batch VARCHAR"]
+
+
+def test_procedure_compile_failure_does_not_skip_ahead_to_tasks():
+    class Scripted:
+        backend = "snowflake"
+
+        def __init__(self):
+            self.statements: list[str] = []
+
+        def execute(self, sql, params=None):
+            self.statements.append(sql)
+            folded = " ".join(sql.lower().split())
+            if folded.startswith("create") and " procedure " in folded[:180] and "load_staging" in folded:
+                raise RuntimeError(
+                    "Cannot overload PROCEDURE LOAD_STAGING as it would cause ambiguous PROCEDURE overloading."
+                )
+
+    warehouse = Scripted()
+    with pytest.raises(ProcedureCompileError, match="tasks were not created"):
+        install_event_driven(warehouse)
+    assert not any(" task " in " ".join(statement.lower().split())[:80] for statement in warehouse.statements)
 
 
 def test_compilation_error_is_not_a_missing_privilege():

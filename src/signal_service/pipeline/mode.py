@@ -60,10 +60,15 @@ def resolve_mode(warehouse, requested: str | None = None) -> ModeReport:
     return selected
 
 
+class ProcedureCompileError(RuntimeError):
+    """A sandbox procedure did not compile, so tasks were not created."""
+
+
 def install_event_driven(warehouse) -> ModeReport:
     """Create streams, tasks, and LOAD_STAGING when the role allows it.
 
-    A denied privilege is recorded and skipped. Nothing here issues a GRANT.
+    A denied privilege is recorded and skipped. A procedure that fails to
+    compile stops the install. Nothing here issues a GRANT.
     """
     missing: list[str] = []
     notes: list[str] = []
@@ -78,8 +83,20 @@ def install_event_driven(warehouse) -> ModeReport:
         procedure_ok = False
         missing.append("CREATE PROCEDURE")
     for statement in procedure_statements:
-        if not _try(warehouse, statement, missing, errors):
-            procedure_ok = False
+        try:
+            warehouse.execute(statement)
+        except Exception as exc:
+            if is_privilege_denial(exc):
+                missing.append(privilege_for(statement))
+                errors.append(f"{privilege_for(statement)}: {str(exc)[:240]}")
+                procedure_ok = False
+                continue
+            raise ProcedureCompileError(
+                "Sandbox procedure failed to compile, so tasks were not created. "
+                "LOAD_STAGING must stay LOAD_STAGING(batch VARCHAR). A second argument "
+                "overloads the procedure already in the sandbox and Snowflake rejects it. "
+                f"{exc}"
+            ) from exc
     tasks_ok = False
     if streams_ok and procedure_ok:
         task_statements = medallion_statements("task")

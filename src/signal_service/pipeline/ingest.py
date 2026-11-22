@@ -243,11 +243,10 @@ def _load_staging(warehouse, batch_id: str, report, rerun: bool) -> tuple[str, s
             "LOAD_STAGING is not available. Snowflake ingest does not pull bronze rows into the client.",
         )
     if rerun:
-        statement = "CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(?, ?)"
-        params = [batch_id, True]
+        statement = "CALL MCP_DB.SIGNAL_SANDBOX.RERUN_STAGING(?)"
     else:
         statement = "CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(?)"
-        params = [batch_id]
+    params = [batch_id]
     try:
         warehouse.execute(statement, params)
     except Exception as exc:
