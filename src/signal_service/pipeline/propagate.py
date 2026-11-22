@@ -214,14 +214,68 @@ def _merge(warehouse, table: str, columns: list[str], keys: list[str], rows: lis
     return written
 
 
+def _is_pii(reason: str | None) -> bool:
+    return bool(reason) and str(reason).startswith("pii")
+
+
+def _removed_keys(warehouse, batch_id: str, source: str) -> set[str]:
+    rows = warehouse.query(
+        """
+        SELECT row_key
+        FROM silver_rejects
+        WHERE _batch_id = ?
+          AND source_table = ?
+          AND removed_by IS NOT NULL
+          AND row_key IS NOT NULL
+        """,
+        [batch_id, source],
+    )
+    return {str(row["row_key"]) for row in rows}
+
+
+def _annotate(rows, reason_fn, loaded_at, batch_id, key: str, removed: set[str]):
+    """Keep every non-PII row. Suspect rows carry the validation reason."""
+    kept: list[dict] = []
+    rejected: list[tuple[dict, str]] = []
+    skipped = 0
+    for row in rows:
+        reason = reason_fn(row)
+        if _is_pii(reason):
+            rejected.append((row, reason))
+            continue
+        identity = row.get(key)
+        if reason and identity is not None and str(identity) in removed:
+            skipped += 1
+            continue
+        landed = _with_load(row, loaded_at, batch_id, drop=("_ingested_at", "_source"))
+        landed["dq_status"] = "suspect" if reason else "ok"
+        landed["dq_reason"] = reason
+        kept.append(landed)
+    return kept, rejected, skipped
+
+
+def _replace_batch(warehouse, table: str, columns: list[str], rows: list[dict], batch_id: str) -> int:
+    warehouse.execute(f"DELETE FROM {table} WHERE _batch_id = ?", [batch_id])
+    if not rows:
+        return 0
+    names = ", ".join(columns)
+    placeholders = ", ".join(["?"] * len(columns))
+    warehouse.executemany(
+        f"INSERT INTO {table} ({names}) VALUES ({placeholders})",
+        [tuple(row.get(column) for column in columns) for row in rows],
+    )
+    return len(rows)
+
+
 def _insert_rejects(warehouse, batch_id: str, loaded_at: datetime, source: str, rejected: list[tuple[dict, str]]) -> None:
     if not rejected:
         return
     warehouse.executemany(
         """
         INSERT INTO silver_rejects (
-            reject_id, source_table, row_json, reason, _loaded_at, _batch_id
-        ) VALUES (?, ?, ?, ?, ?, ?)
+            reject_id, source_table, row_json, reason, _loaded_at, _batch_id,
+            row_key, removed_by, removed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -231,6 +285,9 @@ def _insert_rejects(warehouse, batch_id: str, loaded_at: datetime, source: str, 
                 reason,
                 loaded_at,
                 batch_id,
+                None,
+                None,
+                None,
             )
             for index, (row, reason) in enumerate(rejected)
         ],
@@ -250,18 +307,35 @@ def _split(rows: list[dict], reason_fn) -> tuple[list[dict], list[tuple[dict, st
 
 
 def load_silver(warehouse, batch_id: str, loaded_at: datetime) -> dict:
-    warehouse.execute("DELETE FROM silver_rejects WHERE _batch_id = ?", [batch_id])
+    warehouse.execute(
+        "DELETE FROM silver_rejects WHERE _batch_id = ? AND removed_by IS NULL",
+        [batch_id],
+    )
     rows_in = 0
     rows_out = 0
     rows_rejected = 0
 
-    groups = warehouse.query("SELECT * FROM bronze_groups WHERE _batch_id = ? ORDER BY _ingested_at, group_id", [batch_id])
-    rows_in += len(groups)
+    def take(source, table, key, columns, query, reason_fn):
+        nonlocal rows_in, rows_out, rows_rejected
+        incoming = warehouse.query(query, [batch_id])
+        rows_in += len(incoming)
+        kept, rejected, skipped = _annotate(
+            incoming,
+            reason_fn,
+            loaded_at,
+            batch_id,
+            key,
+            _removed_keys(warehouse, batch_id, source),
+        )
+        rows_out += _replace_batch(warehouse, table, columns, kept, batch_id)
+        _insert_rejects(warehouse, batch_id, loaded_at, source, rejected)
+        rows_rejected += len(rejected) + skipped
+
     seen: set[str] = set()
-    good, bad = _split(groups, lambda row: group_reason(row, seen))
-    rows_out += _merge(
-        warehouse,
+    take(
+        "bronze_groups",
         "silver_groups",
+        "group_id",
         [
             "group_id",
             "hour",
@@ -276,23 +350,17 @@ def load_silver(warehouse, batch_id: str, loaded_at: datetime) -> dict:
             "n_attempt",
             "_loaded_at",
             "_batch_id",
+            "dq_status",
+            "dq_reason",
         ],
-        ["group_id"],
-        [_with_load(row, loaded_at, batch_id, drop=("_ingested_at", "_source")) for row in good],
+        "SELECT * FROM bronze_groups WHERE _batch_id = ? ORDER BY _ingested_at, group_id",
+        lambda row: group_reason(row, seen),
     )
-    _insert_rejects(warehouse, batch_id, loaded_at, "bronze_groups", bad)
-    rows_rejected += len(bad)
-
-    tickets = warehouse.query(
-        "SELECT * FROM bronze_support_tickets WHERE _batch_id = ? ORDER BY _ingested_at, ticket_id",
-        [batch_id],
-    )
-    rows_in += len(tickets)
     seen = set()
-    good, bad = _split(tickets, lambda row: ticket_reason(row, seen))
-    rows_out += _merge(
-        warehouse,
+    take(
+        "bronze_support_tickets",
         "silver_support_tickets",
+        "ticket_id",
         [
             "ticket_id",
             "ts",
@@ -306,46 +374,30 @@ def load_silver(warehouse, batch_id: str, loaded_at: datetime) -> dict:
             "text_redacted",
             "_loaded_at",
             "_batch_id",
+            "dq_status",
+            "dq_reason",
         ],
-        ["ticket_id"],
-        [_with_load(row, loaded_at, batch_id, drop=("_ingested_at", "_source")) for row in good],
+        "SELECT * FROM bronze_support_tickets WHERE _batch_id = ? ORDER BY _ingested_at, ticket_id",
+        lambda row: ticket_reason(row, seen),
     )
-    _insert_rejects(warehouse, batch_id, loaded_at, "bronze_support_tickets", bad)
-    rows_rejected += len(bad)
-
-    deploys = warehouse.query("SELECT * FROM bronze_deploys WHERE _batch_id = ? ORDER BY deploy_id", [batch_id])
-    rows_in += len(deploys)
     seen = set()
-    good, bad = _split(deploys, lambda row: _simple_reason(row, "deploy_id", seen, "deploy_id"))
-    rows_out += _merge(
-        warehouse,
+    take(
+        "bronze_deploys",
         "silver_deploys",
-        ["deploy_id", "deployed_at", "platform", "app_version", "note", "_loaded_at", "_batch_id"],
-        ["deploy_id"],
-        [_with_load(row, loaded_at, batch_id, drop=("_ingested_at", "_source")) for row in good],
+        "deploy_id",
+        ["deploy_id", "deployed_at", "platform", "app_version", "note", "_loaded_at", "_batch_id", "dq_status", "dq_reason"],
+        "SELECT * FROM bronze_deploys WHERE _batch_id = ? ORDER BY deploy_id",
+        lambda row: _simple_reason(row, "deploy_id", seen, "deploy_id"),
     )
-    _insert_rejects(warehouse, batch_id, loaded_at, "bronze_deploys", bad)
-    rows_rejected += len(bad)
-
-    meta = warehouse.query("SELECT * FROM bronze_demo_meta WHERE _batch_id = ? ORDER BY key", [batch_id])
-    rows_in += len(meta)
     seen = set()
-    good, bad = _split(meta, lambda row: _simple_reason(row, "key", seen, "meta key"))
-    rows_out += _merge(
-        warehouse,
+    take(
+        "bronze_demo_meta",
         "silver_demo_meta",
-        ["key", "value", "_loaded_at", "_batch_id"],
-        ["key"],
-        [_with_load(row, loaded_at, batch_id, drop=("_ingested_at", "_source")) for row in good],
+        "key",
+        ["key", "value", "_loaded_at", "_batch_id", "dq_status", "dq_reason"],
+        "SELECT * FROM bronze_demo_meta WHERE _batch_id = ? ORDER BY key",
+        lambda row: _simple_reason(row, "key", seen, "meta key"),
     )
-    _insert_rejects(warehouse, batch_id, loaded_at, "bronze_demo_meta", bad)
-    rows_rejected += len(bad)
-
-    golden = warehouse.query(
-        "SELECT * FROM bronze_golden_tickets WHERE _batch_id = ? ORDER BY example_id",
-        [batch_id],
-    )
-    rows_in += len(golden)
     seen = set()
 
     def golden_reason(row: dict) -> str | None:
@@ -357,10 +409,10 @@ def load_silver(warehouse, batch_id: str, loaded_at: datetime) -> dict:
             return "pii:" + ",".join(kinds)
         return None
 
-    good, bad = _split(golden, golden_reason)
-    rows_out += _merge(
-        warehouse,
+    take(
+        "bronze_golden_tickets",
         "silver_golden_tickets",
+        "example_id",
         [
             "example_id",
             "text_redacted",
@@ -370,23 +422,17 @@ def load_silver(warehouse, batch_id: str, loaded_at: datetime) -> dict:
             "product_area",
             "_loaded_at",
             "_batch_id",
+            "dq_status",
+            "dq_reason",
         ],
-        ["example_id"],
-        [_with_load(row, loaded_at, batch_id, drop=("_ingested_at", "_source")) for row in good],
+        "SELECT * FROM bronze_golden_tickets WHERE _batch_id = ? ORDER BY example_id",
+        golden_reason,
     )
-    _insert_rejects(warehouse, batch_id, loaded_at, "bronze_golden_tickets", bad)
-    rows_rejected += len(bad)
-
-    external = warehouse.query(
-        "SELECT * FROM bronze_external_events WHERE _batch_id = ? ORDER BY event_id",
-        [batch_id],
-    )
-    rows_in += len(external)
     seen = set()
-    good, bad = _split(external, lambda row: _simple_reason(row, "event_id", seen, "event_id"))
-    rows_out += _merge(
-        warehouse,
+    take(
+        "bronze_external_events",
         "silver_external_events",
+        "event_id",
         [
             "event_id",
             "case_id",
@@ -400,12 +446,12 @@ def load_silver(warehouse, batch_id: str, loaded_at: datetime) -> dict:
             "provider",
             "_loaded_at",
             "_batch_id",
+            "dq_status",
+            "dq_reason",
         ],
-        ["event_id"],
-        [_with_load(row, loaded_at, batch_id, drop=("_ingested_at", "_source")) for row in good],
+        "SELECT * FROM bronze_external_events WHERE _batch_id = ? ORDER BY event_id",
+        lambda row: _simple_reason(row, "event_id", seen, "event_id"),
     )
-    _insert_rejects(warehouse, batch_id, loaded_at, "bronze_external_events", bad)
-    rows_rejected += len(bad)
     return {"rows_in": rows_in, "rows_out": rows_out, "rows_rejected": rows_rejected}
 
 
@@ -431,11 +477,15 @@ def load_gold(warehouse, batch_id: str, loaded_at: datetime) -> dict:
         """
         SELECT hour, platform, country, payment_method, app_version,
                SUM(n_sessions)::INTEGER AS sessions,
-               SUM(n_convert)::INTEGER AS converted
+               SUM(n_convert)::INTEGER AS converted,
+               SUM(CASE WHEN COALESCE(dq_status, 'ok') = 'suspect' AND _batch_id = ? THEN 1 ELSE 0 END)::INTEGER
+                   AS dq_suspect_rows
         FROM silver_groups
+        WHERE hour IS NOT NULL
         GROUP BY 1, 2, 3, 4, 5
         ORDER BY 1, 2, 3, 4, 5
-        """
+        """,
+        [batch_id],
     )
     batch_keys = {
         (
@@ -477,6 +527,7 @@ def load_gold(warehouse, batch_id: str, loaded_at: datetime) -> dict:
                 "seasonal_index": row["seasonal_index"],
                 "expected_rate": row["expected_rate"],
                 "is_anomaly": row["is_anomaly"],
+                "dq_suspect_rows": int(row.get("dq_suspect_rows") or 0),
                 "_batch_id": batch_id,
                 "_loaded_at": loaded_at,
             }
@@ -493,6 +544,7 @@ def load_gold(warehouse, batch_id: str, loaded_at: datetime) -> dict:
                 "aov_usd": aov,
                 "session_weight": weight,
                 "revenue_at_risk_usd": lost * aov * weight,
+                "dq_suspect_rows": int(row.get("dq_suspect_rows") or 0),
                 "_batch_id": batch_id,
                 "_loaded_at": loaded_at,
             }
@@ -512,6 +564,7 @@ def load_gold(warehouse, batch_id: str, loaded_at: datetime) -> dict:
         "seasonal_index",
         "expected_rate",
         "is_anomaly",
+        "dq_suspect_rows",
         "_batch_id",
         "_loaded_at",
     ]
@@ -535,17 +588,24 @@ def load_gold(warehouse, batch_id: str, loaded_at: datetime) -> dict:
             "aov_usd",
             "session_weight",
             "revenue_at_risk_usd",
+            "dq_suspect_rows",
             "_batch_id",
             "_loaded_at",
         ],
         ["hour", "platform", "country", "payment_method", "app_version"],
         revenue_rows,
     )
-    spend_rows = _spend_rows(warehouse, batch_id, loaded_at, grains)
+    spend_rows = _spend_rows(
+        warehouse,
+        batch_id,
+        loaded_at,
+        grains,
+        suspect_rows=sum(int(row.get("dq_suspect_rows") or 0) for row in conversion_rows),
+    )
     _merge(
         warehouse,
         "gold_daily_spend",
-        ["spend_date", "spend_usd", "cap_usd", "headroom_usd", "_batch_id", "_loaded_at"],
+        ["spend_date", "spend_usd", "cap_usd", "headroom_usd", "dq_suspect_rows", "_batch_id", "_loaded_at"],
         ["spend_date", "_batch_id"],
         spend_rows,
     )
@@ -597,7 +657,7 @@ def _score_grains(grains: list[dict]) -> list[dict]:
     return scored
 
 
-def _spend_rows(warehouse, batch_id: str, loaded_at: datetime, grains: list[dict]) -> list[dict]:
+def _spend_rows(warehouse, batch_id: str, loaded_at: datetime, grains: list[dict], suspect_rows: int = 0) -> list[dict]:
     from signal_service.config import load_settings
 
     cap = float(load_settings().daily_spend_cap_usd)
@@ -623,6 +683,7 @@ def _spend_rows(warehouse, batch_id: str, loaded_at: datetime, grains: list[dict
             "spend_usd": spent,
             "cap_usd": cap,
             "headroom_usd": cap - spent,
+            "dq_suspect_rows": int(suspect_rows),
             "_batch_id": batch_id,
             "_loaded_at": loaded_at,
         }

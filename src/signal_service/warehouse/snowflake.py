@@ -76,6 +76,7 @@ _KNOWN_TABLES = {
     "GOLD_EXTERNAL_EVENTS",
     "GOLD_DAILY_SPEND",
     "GOLD_HEALTH",
+    "GOLD_DATA_QUALITY",
     "GOLD_PIPELINE_LAG",
     "PIPELINE_RUNS",
     "STREAM_BATCH_QUEUE",
@@ -345,13 +346,23 @@ def _assert_created_object_qualified(text: str, sandbox: str) -> None:
 def _assert_alter_or_call(text: str, sandbox: str) -> None:
     collapsed = " ".join(text.split())
     if re.match(r"(?is)^alter\b", collapsed):
-        pattern = rf"(?is)^alter\s+task\s+{re.escape(sandbox)}\.[A-Za-z_][A-Za-z0-9_]*\s+resume$"
-        if not re.match(pattern, collapsed):
-            raise UnsafeSQL(f"only ALTER TASK {sandbox}.<task> RESUME is allowed")
+        task = rf"(?is)^alter\s+task\s+{re.escape(sandbox)}\.[A-Za-z_][A-Za-z0-9_]*\s+resume$"
+        column = (
+            rf"(?is)^alter\s+table\s+{re.escape(sandbox)}\.[A-Za-z_][A-Za-z0-9_]*\s+"
+            r"add\s+column\s+(?:if\s+not\s+exists\s+)?[A-Za-z_][A-Za-z0-9_]*\s+"
+            r"[A-Za-z_][A-Za-z0-9_]*"
+            r"(?:\s+default\s+(?:'[^']*'|-?\d+))?\s*$"
+        )
+        if not re.match(task, collapsed) and not re.match(column, collapsed):
+            raise UnsafeSQL(
+                f"only ALTER TASK {sandbox}.<task> RESUME or ALTER TABLE {sandbox}.<table> ADD COLUMN is allowed"
+            )
     if re.match(r"(?is)^call\b", collapsed):
-        pattern = rf"(?is)^call\s+{re.escape(sandbox)}\.(?:LOAD_STAGING|RERUN_STAGING)\s*\("
+        pattern = rf"(?is)^call\s+{re.escape(sandbox)}\.(?:LOAD_STAGING|RERUN_STAGING|REMOVE_SUSPECT)\s*\("
         if not re.match(pattern, collapsed):
-            raise UnsafeSQL(f"only CALL {sandbox}.LOAD_STAGING or {sandbox}.RERUN_STAGING is allowed")
+            raise UnsafeSQL(
+                f"only CALL {sandbox}.LOAD_STAGING, {sandbox}.RERUN_STAGING, or {sandbox}.REMOVE_SUSPECT is allowed"
+            )
 
 
 def _assert_allowed_procedure(text: str, sandbox: str) -> None:
@@ -362,13 +373,19 @@ def _assert_allowed_procedure(text: str, sandbox: str) -> None:
     """
     match = re.match(
         r"(?is)^create\s+(?:or\s+replace\s+)?procedure\s+"
-        rf"{re.escape(sandbox)}\.(LOAD_STAGING|RERUN_STAGING)\s*\((.*?)\)",
+        rf"{re.escape(sandbox)}\.(LOAD_STAGING|RERUN_STAGING|REMOVE_SUSPECT)\s*\((.*?)\)",
         text,
     )
     if match is None:
-        raise UnsafeSQL(f"only procedures {sandbox}.LOAD_STAGING and {sandbox}.RERUN_STAGING may be created")
+        raise UnsafeSQL(
+            f"only procedures {sandbox}.LOAD_STAGING, {sandbox}.RERUN_STAGING, and {sandbox}.REMOVE_SUSPECT may be created"
+        )
     args = " ".join(match.group(2).split())
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\s+VARCHAR", args, re.IGNORECASE):
+    if match.group(1).upper() == "REMOVE_SUSPECT":
+        expected = r"[A-Za-z_][A-Za-z0-9_]*\s+VARCHAR\s*,\s*[A-Za-z_][A-Za-z0-9_]*\s+VARCHAR"
+        if not re.fullmatch(expected, args, re.IGNORECASE):
+            raise UnsafeSQL("REMOVE_SUSPECT must take exactly (batch VARCHAR, reason VARCHAR)")
+    elif not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\s+VARCHAR", args, re.IGNORECASE):
         raise UnsafeSQL(
             f"{match.group(1)} must take exactly one VARCHAR argument so it replaces the existing procedure"
         )

@@ -52,8 +52,17 @@ def collect(warehouse) -> dict:
     health = _rows(
         warehouse,
         """
-        SELECT layer, row_count, fresh_at, latest_status
+        SELECT layer, row_count, fresh_at, latest_status, suspect_rows
         FROM gold_health
+        """,
+    )
+    quality = _rows(
+        warehouse,
+        """
+        SELECT batch_id, "table", "key", reason, first_seen
+        FROM gold_data_quality
+        ORDER BY first_seen DESC
+        LIMIT 50
         """,
     )
     conversion = _rows(
@@ -64,7 +73,8 @@ def collect(warehouse) -> dict:
                SUM(converted)::INTEGER AS converted,
                SUM(converted)::DOUBLE / NULLIF(SUM(sessions), 0) AS conversion_rate,
                AVG(baseline_rate)::DOUBLE AS baseline_rate,
-               MAX(CASE WHEN is_anomaly THEN 1 ELSE 0 END)::INTEGER AS is_anomaly
+               MAX(CASE WHEN is_anomaly THEN 1 ELSE 0 END)::INTEGER AS is_anomaly,
+               SUM(dq_suspect_rows)::INTEGER AS dq_suspect_rows
         FROM gold_hourly_conversion
         WHERE platform = 'android' AND country = 'IN'
         GROUP BY hour
@@ -85,7 +95,9 @@ def collect(warehouse) -> dict:
     revenue_rows = _rows(
         warehouse,
         """
-        SELECT hour, SUM(revenue_at_risk_usd)::DOUBLE AS revenue_at_risk_usd
+        SELECT hour,
+               SUM(revenue_at_risk_usd)::DOUBLE AS revenue_at_risk_usd,
+               SUM(dq_suspect_rows)::INTEGER AS dq_suspect_rows
         FROM gold_revenue_at_risk
         WHERE platform = 'android' AND country = 'IN'
         GROUP BY hour
@@ -145,6 +157,8 @@ def collect(warehouse) -> dict:
         "topics": topics,
         "spend": spend,
         "lag": lag,
+        "quality": quality,
+        "suspect_rows": sum(int(row.get("suspect_rows") or 0) for row in health if row.get("layer") == "gold"),
     }
 
 
@@ -200,6 +214,8 @@ def _summary(data: dict) -> dict:
         "spend_usd": latest_spend.get("spend_usd", 0),
         "cap_usd": latest_spend.get("cap_usd", 25),
         "health": data["health"],
+        "suspect_rows": data.get("suspect_rows") or 0,
+        "suspect_reasons": sorted({row.get("reason") for row in data.get("quality") or [] if row.get("reason")}),
     }
 
 
@@ -211,12 +227,18 @@ def mock_answer(summary: dict) -> str:
     case_text = ", ".join(item["case_id"] for item in cases[:3]) or "none"
     topics = summary.get("topics") or []
     topic_text = ", ".join(f"{item['topic']} ({item['ticket_count']})" for item in topics[:3]) or "none yet"
+    suspects = int(summary.get("suspect_rows") or 0)
+    quality = ""
+    if suspects:
+        reasons = ", ".join(summary.get("suspect_reasons") or []) or "unspecified"
+        quality = f" Data quality: {suspects} suspect rows ({reasons}). Affected metrics are marked."
     return (
         f"Gold marts: {summary.get('anomaly_count', 0)} hourly slices are below the seasonal baseline. "
         f"Revenue at risk across the mart is ${revenue:,.0f}. "
         f"Open cases: {case_text}. "
         f"Ticket topics: {topic_text}. "
         f"Recorded spend is ${spend:.2f} against a ${cap:.0f} cap."
+        f"{quality}"
     )
 
 
@@ -258,7 +280,8 @@ def answer(
     system = (
         _persona_text(persona)
         + "\n\nYou are answering from the gold mart only. "
-        + "Do not invent numbers. Do not ask to load data or change the warehouse.\n"
+        + "Do not invent numbers. Do not ask to load data or change the warehouse. "
+        + "When suspect_rows is greater than zero, mention the suspect data and its reasons.\n"
         + json.dumps(summary, default=str)
     )
     provider = getattr(client, "provider", "mock")
@@ -297,6 +320,26 @@ def _page(data: dict) -> str:
     banner = "Gold is current"
     if any(row.get("latest_status") not in {None, "success"} for row in data["health"]):
         banner = "A layer step needs attention"
+    suspects = data.get("quality") or []
+    if suspects:
+        quality_banner = (
+            f"Data quality: {len(suspects)} suspect row"
+            f"{'' if len(suspects) == 1 else 's'}. Affected metrics are marked."
+        )
+        quality_class = "banner warn"
+    else:
+        quality_banner = "Data quality: no suspect rows."
+        quality_class = "banner"
+    quality_rows = "".join(
+        "<tr class=\"suspect\">"
+        f"<td>{_esc(row.get('batch_id'))}</td>"
+        f"<td>{_esc(row.get('table'))}</td>"
+        f"<td>{_esc(row.get('key'))}</td>"
+        f"<td>{_esc(row.get('reason'))}</td>"
+        f"<td>{_esc(row.get('first_seen'))}</td>"
+        "</tr>"
+        for row in suspects
+    ) or "<tr><td colspan=\"5\">No suspect rows.</td></tr>"
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -319,6 +362,8 @@ def _page(data: dict) -> str:
     canvas {{ width: 100%; max-height: 280px; }}
     table {{ width: 100%; border-collapse: collapse; font-family: "Avenir Next", "Segoe UI", sans-serif; font-size: 0.88rem; }}
     th, td {{ text-align: left; padding: 0.3rem 0.4rem; border-bottom: 1px solid var(--line); }}
+    tr.suspect td {{ background: #fde8df; }}
+    .mark {{ color: #9a3412; font-weight: 600; }}
     button, select, textarea {{ font: inherit; }}
     button {{ background: var(--teal); color: white; border: 0; padding: 0.55rem 0.8rem; cursor: pointer; }}
     textarea {{ width: 100%; min-height: 5rem; }}
@@ -336,6 +381,14 @@ def _page(data: dict) -> str:
   </header>
   <main>
     <div id="banner" class="banner">{banner}</div>
+    <div id="quality-banner" class="{quality_class}">{quality_banner}</div>
+    <section id="data-quality">
+      <h2>Data quality</h2>
+      <table>
+        <tr><th>Batch</th><th>Table</th><th>Key</th><th>Reason</th><th>First seen</th></tr>
+        {quality_rows}
+      </table>
+    </section>
     <section>
       <h2>Layer freshness</h2>
       <ul id="health">{health}</ul>
@@ -394,8 +447,23 @@ def _page(data: dict) -> str:
       banner.textContent = attention ? 'A layer step needs attention' : 'Gold is current';
       banner.className = attention ? 'banner warn' : 'banner';
       document.getElementById('health').innerHTML = (data.health || []).map(row =>
-        '<li><strong>' + row.layer + '</strong> ' + row.row_count + ' rows, status ' + row.latest_status + ', fresh ' + row.fresh_at + '</li>'
+        '<li><strong>' + row.layer + '</strong> ' + row.row_count + ' rows, status ' + row.latest_status
+        + ', fresh ' + row.fresh_at
+        + (Number(row.suspect_rows) ? ', <span class="mark">' + row.suspect_rows + ' suspect</span>' : '')
+        + '</li>'
       ).join('');
+      const suspects = data.quality || [];
+      const qualityBanner = document.getElementById('quality-banner');
+      qualityBanner.textContent = suspects.length
+        ? 'Data quality: ' + suspects.length + ' suspect row' + (suspects.length === 1 ? '' : 's') + '. Affected metrics are marked.'
+        : 'Data quality: no suspect rows.';
+      qualityBanner.className = suspects.length ? 'banner warn' : 'banner';
+      const qualityTable = document.querySelector('#data-quality table');
+      qualityTable.innerHTML = '<tr><th>Batch</th><th>Table</th><th>Key</th><th>Reason</th><th>First seen</th></tr>'
+        + (suspects.length ? suspects.map(row =>
+          '<tr class="suspect"><td>' + (row.batch_id ?? '') + '</td><td>' + (row.table ?? '') + '</td><td>'
+          + (row.key ?? '') + '</td><td>' + (row.reason ?? '') + '</td><td>' + (row.first_seen ?? '') + '</td></tr>'
+        ).join('') : '<tr><td colspan="5">No suspect rows.</td></tr>');
       document.getElementById('revenue-total').textContent = 'Mart total ' + money(data.revenue_at_risk_usd);
       document.getElementById('cases').innerHTML = table(
         [['Case', 'case_id'], ['Metric', 'metric'], ['Status', 'status'], ['Severity', 'severity'], ['At risk / hour', 'revenue_at_risk_usd']],
@@ -412,7 +480,9 @@ def _page(data: dict) -> str:
       const labels = (data.conversion || []).map(row => String(row.hour).slice(0, 16));
       const rates = (data.conversion || []).map(row => row.conversion_rate);
       const baseline = (data.conversion || []).map(row => row.baseline_rate);
-      const colors = (data.conversion || []).map(row => row.is_anomaly ? '#9a3412' : '#0f5c56');
+      const colors = (data.conversion || []).map(row =>
+        Number(row.dq_suspect_rows) ? '#b45309' : (row.is_anomaly ? '#9a3412' : '#0f5c56')
+      );
       if (conversionChart) conversionChart.destroy();
       conversionChart = new Chart(document.getElementById('conversion'), {{
         type: 'line',
@@ -430,7 +500,11 @@ def _page(data: dict) -> str:
         type: 'bar',
         data: {{
           labels: (data.revenue || []).map(row => String(row.hour).slice(0, 16)),
-          datasets: [{{ label: 'USD', data: (data.revenue || []).map(row => row.revenue_at_risk_usd), backgroundColor: '#0f5c56' }}]
+          datasets: [{{
+            label: 'USD',
+            data: (data.revenue || []).map(row => row.revenue_at_risk_usd),
+            backgroundColor: (data.revenue || []).map(row => Number(row.dq_suspect_rows) ? '#b45309' : '#0f5c56')
+          }}]
         }},
         options: {{ animation: false, plugins: {{ legend: {{ display: false }} }} }}
       }});

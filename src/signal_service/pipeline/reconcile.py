@@ -153,6 +153,66 @@ def reconciliation_errors(
             continue
         if str(row.get("status")) != "success":
             errors.append(f"{layer} status is {row.get('status')}")
+    errors.extend(_suspect_errors(warehouse, batch_id))
+    return errors
+
+
+def _suspect_errors(warehouse, batch_id: str) -> list[str]:
+    """Suspect silver rows are listed once in GOLD_DATA_QUALITY and flag gold."""
+    errors: list[str] = []
+    tables = (
+        ("silver_groups", "groups"),
+        ("silver_support_tickets", "support_tickets"),
+        ("silver_deploys", "deploys"),
+        ("silver_demo_meta", "demo_meta"),
+        ("silver_golden_tickets", "golden_tickets"),
+        ("silver_external_events", "external_events"),
+    )
+    suspect = 0
+    for table, label in tables:
+        count = _count(
+            warehouse,
+            f"""
+            SELECT COUNT(*)::INTEGER AS n
+            FROM {table}
+            WHERE _batch_id = ? AND COALESCE(dq_status, 'ok') = 'suspect'
+            """,
+            [batch_id],
+        )
+        listed = _count(
+            warehouse,
+            """
+            SELECT COUNT(*)::INTEGER AS n
+            FROM gold_data_quality
+            WHERE batch_id = ? AND "table" = ?
+            """,
+            [batch_id, label],
+        )
+        suspect += count
+        if count != listed:
+            errors.append(f"{label} suspects {count} != gold_data_quality {listed}")
+    hourly = _count(
+        warehouse,
+        """
+        SELECT COUNT(*)::INTEGER AS n
+        FROM silver_groups
+        WHERE _batch_id = ? AND COALESCE(dq_status, 'ok') = 'suspect' AND hour IS NOT NULL
+        """,
+        [batch_id],
+    )
+    flagged = _count(
+        warehouse,
+        """
+        SELECT COALESCE(SUM(dq_suspect_rows), 0)::INTEGER AS n
+        FROM gold_hourly_conversion
+        WHERE _batch_id = ?
+        """,
+        [batch_id],
+    )
+    if flagged != hourly:
+        errors.append(f"gold suspect rows {flagged} != suspect groups {hourly}")
+    if suspect and flagged == 0 and hourly:
+        errors.append("suspect rows did not flag gold")
     return errors
 
 

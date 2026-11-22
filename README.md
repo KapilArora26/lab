@@ -139,7 +139,7 @@ Snowflake is optional. The adapter in `src/signal_service/warehouse/snowflake.py
 | `SNOWFLAKE_MCP_URL` | Overrides the URL above. |
 | `SNOWFLAKE_SANDBOX` | Defaults to `MCP_DB.SIGNAL_SANDBOX`. |
 
-Headers are `Authorization: Bearer <token>` and `X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN`. Reads may be `SELECT`, `SHOW`, `DESCRIBE`, or `WITH`. Writes must be fully qualified to the sandbox. The adapter allows `CREATE` (including `STREAM`, `TASK`, `DYNAMIC TABLE`, and `PROCEDURE`), `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING`, and `ALTER TASK ... RESUME`. `DROP`, `TRUNCATE`, `GRANT`, any other `ALTER`, and any other schema are refused in code. The adapter binds `?` placeholders and rewrites `signals.*` plus the demo table names onto the sandbox, so the same pipeline runs on either warehouse.
+Headers are `Authorization: Bearer <token>` and `X-Snowflake-Authorization-Token-Type: PROGRAMMATIC_ACCESS_TOKEN`. Reads may be `SELECT`, `SHOW`, `DESCRIBE`, or `WITH`. Writes must be fully qualified to the sandbox. The adapter allows `CREATE` (including `STREAM`, `TASK`, `DYNAMIC TABLE`, and `PROCEDURE`), `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING`, `CALL MCP_DB.SIGNAL_SANDBOX.REMOVE_SUSPECT`, `ALTER TASK ... RESUME`, and additive `ALTER TABLE ... ADD COLUMN`. `DROP`, `TRUNCATE`, `GRANT`, any other `ALTER`, and any other schema are refused in code. The adapter binds `?` placeholders and rewrites `signals.*` plus the demo table names onto the sandbox, so the same pipeline runs on either warehouse.
 
 ## Medallion pipeline
 
@@ -152,20 +152,32 @@ ingest (CLI or POST /v1/ingest)     on demand, never a schedule
    BRONZE_*   raw landing, PII allowed
               _ingested_at, _source, _batch_id
         |
-        |  DuckDB sync MERGE; Snowflake CALL LOAD_STAGING (tasks use the same call)
+        |  DuckDB sync load; Snowflake CALL LOAD_STAGING (tasks use the same call)
         v
-   SILVER_*   typed, deduplicated, redacted
-              _loaded_at, _batch_id, SILVER_REJECTS
+   SILVER_*   typed rows, dq_status ok or suspect
+              PII never passes this step (SILVER_REJECTS)
+              _loaded_at, _batch_id, dq_status, dq_reason
         |
         v
    GOLD_*     conversion, revenue at risk, cases, topics, spend
-              _loaded_at, _batch_id
+              dq_suspect_rows on the aggregates a suspect row touches
         |
+        +-- GOLD_DATA_QUALITY   every suspect row: batch, table, key, reason
         +-- GOLD_PIPELINE_LAG   bronze_ingested_at, silver_loaded_at,
         |                       gold_loaded_at, staging_to_gold_seconds
-        +-- GOLD_HEALTH
+        +-- GOLD_HEALTH         includes suspect counts
         +-- PIPELINE_RUNS       one row per layer step
+        |
+        v
+   remove-suspect <batch_id>     engineering, on request
+        DELETE only that batch's suspect rows
+        archive them in SILVER_REJECTS (reason, removed_by, removed_at)
+        recompute gold
 ```
+
+A bad but non-PII row lands in bronze, silver keeps it with `dq_status = 'suspect'`, and gold flags the aggregates it contributes to. L3 sees it on `GOLD_DATA_QUALITY` and the dashboard Data quality panel. Engineering removes that batch's suspect rows with `python -m signal_service.cli remove-suspect <batch_id> [--reason]`. The command is idempotent, does not `DROP` or `TRUNCATE`, and leaves `rows_in = rows_out + rows_rejected`. PII rows still stop in `SILVER_REJECTS` and never reach silver or gold.
+
+A load that moves rows writes one `PIPELINE_RUNS` row for the real batch id, with `rows_in = rows_out + rows_rejected`. That includes `LOAD_STAGING` when a stream has a new batch, and the legacy `EXTERNAL_EVENTS` copy into bronze and silver. A no-op, including a stream read that finds no new batch, writes nothing.
 
 ```bash
 python -m signal_service.cli ingest --batch new --db data/warehouse/demo.duckdb
@@ -174,7 +186,7 @@ python -m signal_service.cli ingest --batch file data/batches/example.json
 
 `--batch new` asks the generator for the next hours after the latest bronze timestamp (`SIGNAL_INGEST_HOURS`, default 6). The same `_batch_id` is a no-op. Raw PII stays in `BRONZE_SUPPORT_TICKETS`. Silver tickets are the rows that pass `assert_redacted`; the others land in `SILVER_REJECTS` with the text replaced by `[redacted]`.
 
-`SIGNAL_PIPELINE_MODE` is `auto`, `sync`, `task`, `procedure`, or `dynamic_table`. DuckDB is always `sync`. On Snowflake, `auto` creates table streams, serverless triggered tasks, and `MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(batch VARCHAR)` when the role allows it. The tasks have no `SCHEDULE`. `TASK_BRONZE_TO_SILVER` runs when any bronze stream has data (`STREAM_BRONZE_GROUPS`, `STREAM_BRONZE_SUPPORT_TICKETS`, `STREAM_BRONZE_DEPLOYS`, `STREAM_BRONZE_DEMO_META`, `STREAM_BRONZE_GOLDEN_TICKETS`, `STREAM_BRONZE_EXTERNAL_EVENTS`). `TASK_SILVER_TO_GOLD` runs when `STREAM_SILVER_GROUPS` has data. Both omit `WAREHOUSE`. `TARGET_COMPLETION_INTERVAL = '1 MINUTE'` is the serverless completion target Snowflake requires on a triggered task, and `OVERLAP_POLICY = NO_OVERLAP` keeps `ALLOW_OVERLAPPING_EXECUTION` false. No account parameter is set. Snowflake's own minimum gap between trigger runs stays 30 seconds. `RERUN_STAGING(batch VARCHAR)` is the only reprocess entry point, so the existing one-argument procedure is replaced instead of overloaded. Each task body is a single statement, `CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(NULL)`. The procedure writes `PIPELINE_RUNS`. The only `ALTER` in the migration is `ALTER TASK ... RESUME`, because a new task is suspended. A denied privilege is recorded and that statement is skipped. A SQL compilation error is recorded too, and it is not labeled as a missing privilege. Snowflake ingest calls `LOAD_STAGING` and does not read bronze rows into the client. If the read tool truncates a result page, the adapter raises instead of merging the slice. Dynamic tables at `TARGET_LAG = '1 minute'` are attempted only when `SIGNAL_SNOWFLAKE_WAREHOUSE` is set and tasks could not be created. The ingest response reports `mode`, `propagation`, and `missing_privileges`.
+`SIGNAL_PIPELINE_MODE` is `auto`, `sync`, `task`, `procedure`, or `dynamic_table`. DuckDB is always `sync`. On Snowflake, `auto` creates table streams, serverless triggered tasks, and `MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(batch VARCHAR)` when the role allows it. The tasks have no `SCHEDULE`. `TASK_BRONZE_TO_SILVER` runs when any bronze stream has data (`STREAM_BRONZE_GROUPS`, `STREAM_BRONZE_SUPPORT_TICKETS`, `STREAM_BRONZE_DEPLOYS`, `STREAM_BRONZE_DEMO_META`, `STREAM_BRONZE_GOLDEN_TICKETS`, `STREAM_BRONZE_EXTERNAL_EVENTS`). `TASK_SILVER_TO_GOLD` runs when `STREAM_SILVER_GROUPS` has data. Both omit `WAREHOUSE`. `TARGET_COMPLETION_INTERVAL = '1 MINUTE'` is the serverless completion target Snowflake requires on a triggered task, and `OVERLAP_POLICY = NO_OVERLAP` keeps `ALLOW_OVERLAPPING_EXECUTION` false. No account parameter is set. Snowflake's own minimum gap between trigger runs stays 30 seconds. `RERUN_STAGING(batch VARCHAR)` reprocesses one batch, so the existing one-argument procedure is replaced instead of overloaded. `REMOVE_SUSPECT(batch VARCHAR, reason VARCHAR)` is a separate single signature. Each task body is a single statement, `CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(NULL)`. The procedure writes `PIPELINE_RUNS`. Schema changes are `ALTER TABLE ... ADD COLUMN` with a default of `ok` for existing rows. `ALTER TASK ... RESUME` is still how a new task starts, because a new task is suspended. A denied privilege is recorded and that statement is skipped. A SQL compilation error is recorded too, and it is not labeled as a missing privilege. Snowflake ingest calls `LOAD_STAGING` and does not read bronze rows into the client. If the read tool truncates a result page, the adapter raises instead of merging the slice. Dynamic tables at `TARGET_LAG = '1 minute'` are attempted only when `SIGNAL_SNOWFLAKE_WAREHOUSE` is set and tasks could not be created. The ingest response reports `mode`, `propagation`, and `missing_privileges`.
 
 `python -m signal_service.cli rerun <batch_id>` calls `RERUN_STAGING` on Snowflake and reprocesses a batch whose gold row was marked success. It does not `DROP` or `TRUNCATE`. `ingest --batch seed --rerun` is the same path for the seed batch. If `LOAD_STAGING` or `RERUN_STAGING` fails to compile, install stops and the command exits non-zero. Tasks are not created after that failure. Deploy fails when layer counts do not reconcile.
 
