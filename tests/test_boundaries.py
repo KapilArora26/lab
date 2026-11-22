@@ -144,7 +144,11 @@ def test_new_statement_types_are_sandbox_scoped():
         f"CREATE OR REPLACE STREAM {sandbox}.STREAM_BRONZE_GROUPS ON TABLE {sandbox}.BRONZE_GROUPS APPEND_ONLY = TRUE"
     )
     assert_sandbox_write(
-        f"CREATE OR REPLACE TASK {sandbox}.TASK_BRONZE_TO_SILVER SCHEDULE = '1 MINUTE' "
+        f"CREATE OR REPLACE TASK {sandbox}.TASK_BRONZE_TO_SILVER "
+        "USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = 'XSMALL' "
+        "OVERLAP_POLICY = NO_OVERLAP "
+        "TARGET_COMPLETION_INTERVAL = '1 MINUTE' "
+        f"WHEN SYSTEM$STREAM_HAS_DATA('{sandbox}.STREAM_BRONZE_GROUPS') "
         f"AS CALL {sandbox}.LOAD_STAGING(NULL)"
     )
     assert_sandbox_write(f"ALTER TASK {sandbox}.TASK_BRONZE_TO_SILVER RESUME")
