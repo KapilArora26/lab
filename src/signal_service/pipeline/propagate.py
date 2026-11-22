@@ -70,15 +70,32 @@ def _layer(warehouse, batch_id: str, layer: str, fn):
             error=message,
         )
         raise PipelineError(layer, message) from exc
+    rows_in = int(stats.get("rows_in", 0) or 0)
+    rows_out = int(stats.get("rows_out", 0) or 0)
+    rows_rejected = int(stats.get("rows_rejected", 0) or 0)
+    if rows_in != rows_out + rows_rejected:
+        message = f"rows_in {rows_in} != rows_out {rows_out} + rows_rejected {rows_rejected}"
+        write_run(
+            warehouse,
+            batch_id=batch_id,
+            layer=layer,
+            started_at=started,
+            status="failed",
+            rows_in=rows_in,
+            rows_out=rows_out,
+            rows_rejected=rows_rejected,
+            error=message,
+        )
+        raise PipelineError(layer, message)
     write_run(
         warehouse,
         batch_id=batch_id,
         layer=layer,
         started_at=started,
         status="success",
-        rows_in=stats.get("rows_in", 0),
-        rows_out=stats.get("rows_out", 0),
-        rows_rejected=stats.get("rows_rejected", 0),
+        rows_in=rows_in,
+        rows_out=rows_out,
+        rows_rejected=rows_rejected,
     )
     return stats
 
@@ -524,9 +541,11 @@ def load_gold(warehouse, batch_id: str, loaded_at: datetime) -> dict:
         spend_rows,
     )
     sync_case_facts(warehouse, batch_id, loaded_at)
+    topic_gold = produce_ticket_topics(warehouse, batch_id, loaded_at)
+    produced = len(conversion_rows) + len(revenue_rows) + len(spend_rows) + len(topic_gold)
     return {
-        "rows_in": len(batch_keys),
-        "rows_out": len(conversion_rows) + len(revenue_rows) + len(spend_rows),
+        "rows_in": produced,
+        "rows_out": produced,
         "rows_rejected": 0,
     }
 
@@ -601,15 +620,57 @@ def _spend_rows(warehouse, batch_id: str, loaded_at: datetime, grains: list[dict
     ]
 
 
-def mirror_signals(warehouse, batch_id: str, loaded_at: datetime | None = None) -> dict:
-    """Copy classifier output into silver, then aggregate the gold topic mart."""
+def produce_ticket_topics(warehouse, batch_id: str, loaded_at: datetime | None = None) -> list[dict]:
+    """Classify the seeded incident window, then aggregate it into gold.
+
+    The documented window is Android India from 2026-11-20 02:00 through 07:00:
+    73 tickets after the three PII rows are rejected. The fallback classifier
+    is deterministic and does not call the model. Tickets already stored for
+    the demo case are left in place so a later pipeline run does not relabel them.
+    """
+    from datetime import timedelta
+
+    from signal_service.config import load_settings
+    from signal_service.demo.generate import ANOMALY_START, DEMO_CASE_ID, END
+    from signal_service.grok.client import MockGrokClient
+    from signal_service.signals.tickets import run_ticket_signals
+
+    settings = load_settings()
+    run_ticket_signals(
+        warehouse,
+        MockGrokClient(),
+        case_id=DEMO_CASE_ID,
+        segment={"platform": "android", "country": "IN"},
+        started_at=ANOMALY_START,
+        ended_at=END - timedelta(hours=1),
+        batch_size=settings.batch_size,
+        model=settings.grok_model,
+    )
+    promoted = promote_topics(warehouse, batch_id, loaded_at or clock())
+    return promoted["gold_rows"]
+
+
+def promote_topics(warehouse, batch_id: str, loaded_at: datetime | None = None) -> dict:
+    """Copy classifier rows for this batch into silver and the gold aggregate."""
     loaded_at = loaded_at or clock()
     try:
         topics = warehouse.query("SELECT * FROM signals.ticket_topics")
     except Exception:
         topics = []
+    try:
+        in_batch = {
+            row["ticket_id"]
+            for row in warehouse.query(
+                "SELECT ticket_id FROM bronze_support_tickets WHERE _batch_id = ?",
+                [batch_id],
+            )
+        }
+    except Exception:
+        in_batch = set()
     topic_rows = []
     for row in topics:
+        if row.get("ticket_id") not in in_batch:
+            continue
         topic_rows.append(
             {
                 "ticket_id": row["ticket_id"],
@@ -628,13 +689,56 @@ def mirror_signals(warehouse, batch_id: str, loaded_at: datetime | None = None) 
                 "_batch_id": batch_id,
             }
         )
-    _merge(
-        warehouse,
-        "silver_ticket_topics",
-        list(topic_rows[0].keys()) if topic_rows else [],
-        ["ticket_id", "case_id"],
-        topic_rows,
-    )
+    if topic_rows:
+        _merge(
+            warehouse,
+            "silver_ticket_topics",
+            list(topic_rows[0].keys()),
+            ["ticket_id", "case_id"],
+            topic_rows,
+        )
+    warehouse.execute("DELETE FROM gold_ticket_topics WHERE _batch_id = ?", [batch_id])
+    aggregates = []
+    if topic_rows:
+        aggregates = warehouse.query(
+            """
+            SELECT topic, sentiment, severity, product_area,
+                   COUNT(*)::INTEGER AS ticket_count,
+                   AVG(confidence)::DOUBLE AS avg_confidence
+            FROM silver_ticket_topics
+            WHERE _batch_id = ?
+            GROUP BY 1, 2, 3, 4
+            """,
+            [batch_id],
+        )
+    gold_rows = [
+        {
+            "topic": row["topic"],
+            "sentiment": row["sentiment"],
+            "severity": row["severity"],
+            "product_area": row["product_area"],
+            "ticket_count": int(row["ticket_count"]),
+            "avg_confidence": float(row["avg_confidence"] or 0),
+            "_batch_id": batch_id,
+            "_loaded_at": loaded_at,
+        }
+        for row in aggregates
+    ]
+    if gold_rows:
+        _merge(
+            warehouse,
+            "gold_ticket_topics",
+            list(gold_rows[0].keys()),
+            ["topic", "sentiment", "severity", "product_area", "_batch_id"],
+            gold_rows,
+        )
+    return {"topics": len(topic_rows), "aggregates": len(gold_rows), "gold_rows": gold_rows}
+
+
+def mirror_signals(warehouse, batch_id: str, loaded_at: datetime | None = None) -> dict:
+    """Copy classifier output into silver, then aggregate the gold topic mart."""
+    loaded_at = loaded_at or clock()
+    promoted = promote_topics(warehouse, batch_id, loaded_at)
     try:
         events = warehouse.query("SELECT * FROM signals.external_events")
     except Exception:
@@ -689,41 +793,11 @@ def mirror_signals(warehouse, batch_id: str, loaded_at: datetime | None = None) 
             ["logged_at", "case_id", "kind"],
             spend_rows,
         )
-    warehouse.execute("DELETE FROM gold_ticket_topics WHERE _batch_id = ?", [batch_id])
-    aggregates = []
-    if topic_rows:
-        aggregates = warehouse.query(
-            """
-            SELECT topic, sentiment, severity, product_area,
-                   COUNT(*)::INTEGER AS ticket_count,
-                   AVG(confidence)::DOUBLE AS avg_confidence
-            FROM silver_ticket_topics
-            WHERE _batch_id = ?
-            GROUP BY 1, 2, 3, 4
-            """,
-            [batch_id],
-        )
-    gold_rows = [
-        {
-            "topic": row["topic"],
-            "sentiment": row["sentiment"],
-            "severity": row["severity"],
-            "product_area": row["product_area"],
-            "ticket_count": int(row["ticket_count"]),
-            "avg_confidence": float(row["avg_confidence"] or 0),
-            "_batch_id": batch_id,
-            "_loaded_at": loaded_at,
-        }
-        for row in aggregates
-    ]
-    _merge(
-        warehouse,
-        "gold_ticket_topics",
-        list(gold_rows[0].keys()) if gold_rows else [],
-        ["topic", "sentiment", "severity", "product_area", "_batch_id"],
-        gold_rows,
-    )
-    return {"topics": len(topic_rows), "events": len(event_rows), "aggregates": len(gold_rows)}
+    return {
+        "topics": promoted["topics"],
+        "events": len(event_rows),
+        "aggregates": promoted["aggregates"],
+    }
 
 
 def sync_case_facts(warehouse, batch_id: str, loaded_at: datetime | None = None) -> int:

@@ -130,7 +130,7 @@ ingest (CLI or POST /v1/ingest)     on demand, never a schedule
    BRONZE_*   raw landing, PII allowed
               _ingested_at, _source, _batch_id
         |
-        |  streams + tasks, or CALL LOAD_STAGING, or sync MERGE
+        |  DuckDB sync MERGE; Snowflake CALL LOAD_STAGING (tasks use the same call)
         v
    SILVER_*   typed, deduplicated, redacted
               _loaded_at, _batch_id, SILVER_REJECTS
@@ -152,7 +152,9 @@ python -m signal_service.cli ingest --batch file data/batches/example.json
 
 `--batch new` asks the generator for the next hours after the latest bronze timestamp (`SIGNAL_INGEST_HOURS`, default 6). The same `_batch_id` is a no-op. Raw PII stays in `BRONZE_SUPPORT_TICKETS`. Silver tickets are the rows that pass `assert_redacted`; the others land in `SILVER_REJECTS` with the text replaced by `[redacted]`.
 
-`SIGNAL_PIPELINE_MODE` is `auto`, `sync`, `task`, `procedure`, or `dynamic_table`. DuckDB is always `sync`. On Snowflake, `auto` creates streams, serverless tasks (`WHEN SYSTEM$STREAM_HAS_DATA`), and `MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(batch VARCHAR)` when the role allows it. The only `ALTER` in the migration is `ALTER TASK ... RESUME`, because a new task is suspended. If `CREATE STREAM`, `CREATE TASK`, `EXECUTE TASK`, or `CREATE PROCEDURE` is denied, that statement is skipped and ingest runs the MERGE itself. Dynamic tables at `TARGET_LAG = '1 minute'` are attempted only when `SIGNAL_SNOWFLAKE_WAREHOUSE` is set and tasks could not be created. The ingest response reports `mode`, `propagation`, and `missing_privileges`.
+`SIGNAL_PIPELINE_MODE` is `auto`, `sync`, `task`, `procedure`, or `dynamic_table`. DuckDB is always `sync`. On Snowflake, `auto` creates streams, serverless tasks (`WHEN SYSTEM$STREAM_HAS_DATA`), and `MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(batch VARCHAR, rerun BOOLEAN DEFAULT FALSE)` when the role allows it. Each task body is a single statement, `CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(NULL)`. The procedure writes `PIPELINE_RUNS`. The only `ALTER` in the migration is `ALTER TASK ... RESUME`, because a new task is suspended. A denied privilege is recorded and that statement is skipped. A SQL compilation error is recorded too, and it is not labeled as a missing privilege. Snowflake ingest calls `LOAD_STAGING` and does not read bronze rows into the client. If the read tool truncates a result page, the adapter raises instead of merging the slice. Dynamic tables at `TARGET_LAG = '1 minute'` are attempted only when `SIGNAL_SNOWFLAKE_WAREHOUSE` is set and tasks could not be created. The ingest response reports `mode`, `propagation`, and `missing_privileges`.
+
+`python -m signal_service.cli rerun <batch_id>` reprocesses a batch whose gold row was marked success. It does not `DROP` or `TRUNCATE`. `ingest --batch seed --rerun` is the same path for the seed batch. Deploy fails when layer counts do not reconcile.
 
 A monitor reads:
 
@@ -201,7 +203,7 @@ python -m signal_service.cli deploy-snowflake
 python -m signal_service.cli run-demo --backend snowflake --out artifacts/snowflake-run.json
 ```
 
-`deploy-snowflake` applies both migrations, installs streams, tasks, and `LOAD_STAGING` when the role allows, and loads the seed batch through ingest. It does not delete rows. A second deploy is a no-op for that batch id. It then checks the expansion counts and classifies the seeded incident. `run-demo --backend snowflake` runs detection, diagnosis, ticket classification, external signals, and the brief against that warehouse. Without `XAI_API_KEY` it uses the mock client, same as the DuckDB demo.
+`deploy-snowflake` applies both migrations, installs streams, tasks, and `LOAD_STAGING` when the role allows, and loads the seed batch through ingest. It does not delete rows. A second deploy is a no-op when that batch already reconciled. If a gold success row does not match the table counts, deploy fails and the batch can be reprocessed with `rerun`. It then checks the expansion counts and classifies the seeded incident. `run-demo --backend snowflake` runs detection, diagnosis, ticket classification, external signals, and the brief against that warehouse. Without `XAI_API_KEY` it uses the mock client, same as the DuckDB demo. The adapter reads `SNOWFLAKE_PAT_TOKEN`, or `SNOWFLAKE_PAT` when that is the name present in the environment.
 
 The Snowflake run matched the local DuckDB demo: case `C-2026-1120-001`, Android checkout conversion in India, and H1 “Payment gateway failures on UPI” at confidence 0.80 (0.8018 before the brief rounds it). The case card, both diagnosis packs, the signal counts (73 classified, 3 rejected), the brief, and the voice script were the same.
 

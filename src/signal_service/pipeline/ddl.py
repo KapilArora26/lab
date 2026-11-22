@@ -503,6 +503,13 @@ _STATEMENTS = [
     LEFT JOIN silver s ON s.batch_id = b.batch_id
     LEFT JOIN gold g ON g.batch_id = b.batch_id
     """,
+    """
+    CREATE OR REPLACE VIEW gold_external_events AS
+    SELECT
+        event_id, case_id, title, summary, source_url, source_type, relevance,
+        observed_at, metric, provider, _batch_id, _loaded_at
+    FROM silver_external_events
+    """,
 ]
 
 

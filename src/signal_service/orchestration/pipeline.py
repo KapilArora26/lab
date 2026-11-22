@@ -116,9 +116,7 @@ def run_pipeline(
             topics=load_topics(warehouse, primary["case_id"]),
             external=external_run["items"],
         )
-        from signal_service.pipeline.propagate import mirror_signals
-
-        mirror_signals(warehouse, batch_id=f"signals-{primary['case_id']}")
+        _publish_signals(warehouse, primary["case_id"])
 
     note = quiet_hours_note(memory.preferences(), primary["severity"], _parse(primary["started_at"]))
     brief = exec_brief(primary, pack, quiet_hours_note=note)
@@ -184,6 +182,41 @@ def run_pipeline(
         "verify_pr": verification,
         "calendar_note": _calendar_note(memory, primary),
     }
+
+
+def _publish_signals(warehouse, case_id: str) -> None:
+    """Land classifier output in silver and gold for the batch that owns the tickets.
+
+    Snowflake runs the MERGE inside ``LOAD_STAGING`` so the client does not
+    read the bronze page. DuckDB merges in process.
+    """
+    from signal_service.pipeline.ingest import SEED_BATCH_ID
+    from signal_service.pipeline.propagate import mirror_signals
+
+    batch_id = SEED_BATCH_ID
+    try:
+        rows = warehouse.query(
+            """
+            SELECT _batch_id
+            FROM bronze_support_tickets
+            WHERE ticket_id IN (
+                SELECT ticket_id FROM signals.ticket_topics WHERE case_id = ?
+            )
+            LIMIT 1
+            """,
+            [case_id],
+        )
+    except Exception:
+        rows = []
+    if rows and rows[0].get("_batch_id"):
+        batch_id = rows[0]["_batch_id"]
+    if getattr(warehouse, "backend", "duckdb") == "snowflake":
+        try:
+            warehouse.execute("CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(?)", [batch_id])
+            return
+        except Exception:
+            pass
+    mirror_signals(warehouse, batch_id)
 
 
 def _calendar_note(memory: Memory, card: dict) -> str:

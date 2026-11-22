@@ -153,11 +153,31 @@ def privilege_for(sql: str) -> str:
     return "SANDBOX DDL"
 
 
+def is_privilege_denial(exc: BaseException) -> bool:
+    """True only for an authorization failure.
+
+    A SQL compilation error is not a missing privilege. Callers record it on
+    the mode report and leave ``missing_privileges`` empty for that statement.
+    """
+    text = str(exc).lower()
+    if any(token in text for token in ("compilation", "syntax error", "unexpected")):
+        return False
+    markers = (
+        "insufficient privilege",
+        "access control error",
+        "not authorized",
+        "authorization failed",
+        "permission denied",
+    )
+    return any(marker in text for marker in markers)
+
+
 def _try(warehouse, statement: str, missing: list[str], errors: list[str]) -> bool:
     try:
         warehouse.execute(statement)
     except Exception as exc:
-        missing.append(privilege_for(statement))
+        if is_privilege_denial(exc):
+            missing.append(privilege_for(statement))
         errors.append(f"{privilege_for(statement)}: {str(exc)[:240]}")
         return False
     return True

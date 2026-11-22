@@ -46,6 +46,7 @@ def run_ticket_signals(
         }
     except Exception:
         already = set()
+    preexisting = sum(1 for row in rows if row["ticket_id"] in already)
     rows = [row for row in rows if row["ticket_id"] not in already]
     accepted = []
     rejected = 0
@@ -86,7 +87,7 @@ def run_ticket_signals(
         )
         classified += len(predictions)
     return {
-        "classified": classified,
+        "classified": classified + preexisting,
         "rejected_pii": rejected,
         "provider": client.provider,
         "input_rows": len(rows),

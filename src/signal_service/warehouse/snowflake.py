@@ -73,6 +73,7 @@ _KNOWN_TABLES = {
     "GOLD_REVENUE_AT_RISK",
     "GOLD_CASE_FACTS",
     "GOLD_TICKET_TOPICS",
+    "GOLD_EXTERNAL_EVENTS",
     "GOLD_DAILY_SPEND",
     "GOLD_HEALTH",
     "GOLD_PIPELINE_LAG",
@@ -83,6 +84,10 @@ _RETRY_STATUS = {429, 502, 503, 504}
 
 class UnsafeSQL(ValueError):
     """The statement is outside the sandbox or is not the kind of SQL requested."""
+
+
+class ResultTruncated(RuntimeError):
+    """sql_read_tool returned a partial page. Callers must not merge it."""
 
 
 class SnowflakeIPBlocked(RuntimeError):
@@ -462,6 +467,113 @@ def _error_text(result: dict) -> str:
     return str(result.get("message") or "snowflake tool error")
 
 
+def _as_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    text = str(value).strip()
+    if text.lstrip("-").isdigit():
+        return int(text)
+    return None
+
+
+def _parse_embedded(value: str) -> Any | None:
+    text = value.strip()
+    if not text or text[0] not in "{[":
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+def _collect_result_sets(payload: Any) -> list[dict]:
+    found: list[dict] = []
+    seen: set[int] = set()
+
+    def add(node: dict) -> None:
+        if id(node) in seen:
+            return
+        if "data" in node and ("resultSetMetaData" in node or "numRows" in node):
+            seen.add(id(node))
+            found.append(node)
+        nested = node.get("result_set")
+        if isinstance(nested, dict):
+            add(nested)
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            add(node)
+            for key, value in node.items():
+                if key == "data":
+                    continue
+                if isinstance(value, str):
+                    embedded = _parse_embedded(value)
+                    if embedded is not None:
+                        walk(embedded)
+                    continue
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(payload)
+    return found
+
+
+def _truncated_status(payload: Any) -> str | None:
+    def walk(node: Any) -> str | None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "data":
+                    continue
+                found = walk(value)
+                if found:
+                    return found
+            return None
+        if isinstance(node, list):
+            for item in node:
+                found = walk(item)
+                if found:
+                    return found
+            return None
+        if isinstance(node, str):
+            embedded = _parse_embedded(node)
+            if embedded is not None:
+                return walk(embedded)
+            if "truncat" in node.lower() and len(node) < 800:
+                return node
+        return None
+
+    return walk(payload)
+
+
+def assert_result_complete(payload: Any) -> None:
+    """Raise when a tool result is a partial page.
+
+    ``sql_read_tool`` has returned ``numRows`` for the full query while ``data``
+    held only the first slice, with status text ``Result truncated to fit
+    tool-output budget``. Merging that slice drops the tail and still looks
+    successful.
+    """
+    status = _truncated_status(payload)
+    if status:
+        raise ResultTruncated(status[:500])
+    for result_set in _collect_result_sets(payload):
+        data = result_set.get("data")
+        if not isinstance(data, list):
+            continue
+        meta = result_set.get("resultSetMetaData") if isinstance(result_set.get("resultSetMetaData"), dict) else {}
+        num_rows = _as_int(meta.get("numRows"))
+        if num_rows is None:
+            num_rows = _as_int(result_set.get("numRows"))
+        if num_rows is not None and len(data) < num_rows:
+            raise ResultTruncated(f"result page has {len(data)} rows and numRows is {num_rows}")
+
+
 def token_from_env() -> str:
     return os.environ.get("SNOWFLAKE_PAT_TOKEN") or os.environ.get("SNOWFLAKE_PAT", "")
 
@@ -566,6 +678,7 @@ class SnowflakeWarehouse:
 
     def _call(self, tool: str, sql: str) -> list[dict]:
         payload = self._post(tool, sql)
+        assert_result_complete(payload)
         if payload.get("error"):
             err = payload["error"]
             message = err.get("message", err) if isinstance(err, dict) else err

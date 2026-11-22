@@ -71,10 +71,14 @@ def deploy_sandbox(warehouse: SnowflakeWarehouse, client=None) -> dict:
     ensure_objects(warehouse)
     print("installing streams, tasks, and LOAD_STAGING when the role allows", flush=True)
     installed = install_event_driven(warehouse)
+    warehouse._pipeline_mode = installed
     print(f"loading the seed batch through ingest ({installed.mode})", flush=True)
-    ingested = ingest_seed(warehouse, mode="sync")
+    ingested = ingest_seed(warehouse)
     if ingested["status"] == "failed":
         raise RuntimeError(ingested.get("error") or "seed ingest failed")
+    from signal_service.pipeline.reconcile import assert_reconciled
+
+    assert_reconciled(warehouse, ingested["batch_id"], expect_external=2)
 
     groups = group_rows()
 
@@ -144,6 +148,7 @@ def deploy_sandbox(warehouse: SnowflakeWarehouse, client=None) -> dict:
     topics = _count(warehouse, "SELECT count(*)::INTEGER AS topics FROM signals.ticket_topics")
     if int(topics["topics"]) != 73:
         raise RuntimeError(f"ticket topics are {topics['topics']}, expected 73")
+    assert_reconciled(warehouse, ingested["batch_id"], expect_topics=73, expect_external=2)
     case_id = (demo.get("case_card") or {}).get("case_id")
     if case_id != "C-2026-1120-001" and demo.get("error") != "no anomaly detected":
         lead = ((demo.get("diagnosis_pack") or {}).get("hypotheses") or [{}])[0].get("claim")
