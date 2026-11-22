@@ -17,6 +17,7 @@ from signal_service.warehouse.snowflake import (
     assert_sandbox_write,
     parse_sql_payload,
     prepare_sql,
+    token_source,
 )
 
 
@@ -227,3 +228,28 @@ def test_pat_alias_is_used_when_the_primary_name_is_unset(monkeypatch):
     monkeypatch.setenv("SNOWFLAKE_PAT", "alias-token")
     warehouse = SnowflakeWarehouse()
     assert warehouse.token == "alias-token"
+    assert token_source() == "SNOWFLAKE_PAT"
+
+
+def test_pat_token_is_preferred_when_both_names_are_set(monkeypatch):
+    monkeypatch.setenv("SNOWFLAKE_PAT_TOKEN", "primary-token")
+    monkeypatch.setenv("SNOWFLAKE_PAT", "fallback-token")
+    warehouse = SnowflakeWarehouse()
+    assert warehouse.token == "primary-token"
+    assert token_source() == "SNOWFLAKE_PAT_TOKEN"
+
+
+def test_column_catalog_read_stays_on_information_schema():
+    sql = prepare_sql(
+        """
+        SELECT table_name, column_name
+        FROM MCP_DB.INFORMATION_SCHEMA.COLUMNS
+        WHERE table_schema = ?
+        """,
+        ["SIGNAL_SANDBOX"],
+    )
+    assert "MCP_DB.INFORMATION_SCHEMA.COLUMNS" in sql.upper()
+    assert "SIGNAL_SANDBOX" in sql
+    assert_read_sql(sql)
+    with pytest.raises(UnsafeSQL):
+        assert_sandbox_write("INSERT INTO MCP_DB.INFORMATION_SCHEMA.COLUMNS (table_name) VALUES ('X')")

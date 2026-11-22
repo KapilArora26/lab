@@ -640,9 +640,20 @@ def medallion_statements(section: str | None = None) -> list[str]:
 
 
 def ensure_objects(warehouse) -> None:
+    """Create medallion objects. Snowflake core DDL runs once per warehouse.
+
+    ``deploy-snowflake`` applies this migration and then calls ingest, which
+    calls ``ensure_objects`` again. A second pass would re-issue
+    ``ADD COLUMN IF NOT EXISTS ... DEFAULT``. Snowflake rejects that once the
+    column exists (``ambiguous column name ''``). The adapter also checks
+    ``INFORMATION_SCHEMA.COLUMNS`` before each add, so a later process can
+    apply the same file without rewriting rows.
+    """
     if getattr(warehouse, "backend", "duckdb") == "snowflake":
-        for statement in medallion_statements("core"):
-            warehouse.execute(statement)
+        if not getattr(warehouse, "_sandbox_core_applied", False):
+            for statement in medallion_statements("core"):
+                warehouse.execute(statement)
+            warehouse._sandbox_core_applied = True
     else:
         for statement in duckdb_statements():
             warehouse.execute(statement)
