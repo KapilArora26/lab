@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from signal_service.safety.redaction import pii_kinds
@@ -17,7 +17,13 @@ class PipelineError(RuntimeError):
 
 
 def clock() -> datetime:
-    return datetime.now(UTC).replace(tzinfo=None, microsecond=0)
+    """UTC wall time for lineage columns.
+
+    Stored naive so Snowflake ``TIMESTAMP_NTZ`` and DuckDB ``TIMESTAMP`` keep
+    the UTC clock. A session in America/Los_Angeles must not write Pacific
+    local time into ``_ingested_at``, ``_loaded_at``, or ``PIPELINE_RUNS``.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
 
 
 def write_run(
@@ -118,14 +124,17 @@ def group_reason(row: dict, seen: set[str]) -> str | None:
     sessions = row.get("n_sessions")
     converted = row.get("n_convert")
     attempts = row.get("n_attempt")
-    if sessions is None or int(sessions) < 0:
-        return "negative n_sessions"
-    if converted is None or int(converted) < 0:
-        return "negative n_convert"
-    if attempts is None or int(converted) > int(attempts):
-        return "n_convert exceeds n_attempt"
-    if int(converted) > int(sessions):
-        return "n_convert exceeds n_sessions"
+    if sessions is None or converted is None or attempts is None:
+        return "null metric"
+    sessions = int(sessions)
+    converted = int(converted)
+    attempts = int(attempts)
+    if sessions < 0 or converted < 0 or attempts < 0:
+        return "negative_count"
+    if converted > sessions:
+        return "conversions_gt_sessions"
+    if converted > attempts:
+        return "conversions_gt_attempts"
     if not row.get("platform") or not row.get("country"):
         return "null segment"
     return None

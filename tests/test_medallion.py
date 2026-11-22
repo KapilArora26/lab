@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+import os
+import time
+from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
 
 from signal_service.api.app import create_app
 from signal_service.pipeline.ddl import medallion_statements
-from signal_service.pipeline.ingest import SEED_BATCH_ID, Batch, ingest, ingest_seed, rerun_batch
-from signal_service.pipeline.mode import ModeReport, install_event_driven
+from signal_service.pipeline.ingest import SEED_BATCH_ID, Batch, ingest, ingest_batch, ingest_seed, rerun_batch
+from signal_service.pipeline.mode import ModeReport, dynamic_table_sql, install_event_driven
 from signal_service.pipeline.reconcile import reconciliation_errors
 from signal_service.safety.redaction import pii_kinds
+from signal_service.warehouse.duckdb import DuckDBWarehouse
 
 
 def _count(warehouse, sql: str, params: list | None = None) -> int:
@@ -158,7 +161,7 @@ def test_data_quality_and_pii_stay_out_of_silver_and_gold(demo_wh, tmp_path):
         row["reason"]
         for row in demo_wh.query("SELECT reason FROM silver_rejects WHERE _batch_id = 'dq-batch'")
     }
-    assert "n_convert exceeds n_sessions" in reasons
+    assert "conversions_gt_sessions" in reasons
     assert any(reason.startswith("pii:") for reason in reasons)
     email = "jane.doe@example.com"
     bronze = demo_wh.query("SELECT text_redacted FROM bronze_support_tickets WHERE ticket_id = 't-pii'")
@@ -285,6 +288,131 @@ def test_rerun_keeps_bronze_and_replaces_a_false_success(demo_wh):
     assert _count(demo_wh, "SELECT COUNT(*)::INTEGER AS n FROM bronze_groups") == before_groups
     assert _count(demo_wh, "SELECT COUNT(*)::INTEGER AS n FROM silver_groups") == before_groups
     assert reconciliation_errors(demo_wh, SEED_BATCH_ID, expect_topics=73, expect_external=2) == []
+
+
+def _naive(value) -> datetime:
+    if isinstance(value, datetime):
+        stamp = value
+    else:
+        stamp = datetime.fromisoformat(str(value).replace("Z", ""))
+    if stamp.tzinfo is not None:
+        stamp = stamp.astimezone(timezone.utc).replace(tzinfo=None)
+    return stamp.replace(microsecond=0)
+
+
+def _group(group_id: str, sessions: int, converted: int, attempts: int) -> tuple:
+    return (
+        group_id,
+        datetime(2026, 11, 22, 18, 0, 0),
+        "android",
+        "IN",
+        "app",
+        "upi",
+        "SKU-100",
+        "4.2.1",
+        sessions,
+        converted,
+        attempts,
+    )
+
+
+def test_lineage_timestamps_stay_utc_when_the_process_zone_is_pacific(tmp_path):
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = "America/Los_Angeles"
+    time.tzset()
+    warehouse = DuckDBWarehouse(tmp_path / "utc.duckdb")
+    try:
+        before = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0) - timedelta(seconds=1)
+        batch = Batch(
+            batch_id="utc-batch",
+            source="test",
+            groups=[_group("utc-1", 40, 4, 6)],
+            tickets=[],
+            deploys=[],
+            meta=[],
+            golden=[],
+            external=[],
+        )
+        result = ingest_batch(warehouse, batch)
+        after = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0) + timedelta(seconds=1)
+        assert result["status"] == "success"
+        local_now = datetime.now().replace(tzinfo=None)
+        stamps = [
+            warehouse.query("SELECT _ingested_at AS ts FROM bronze_groups WHERE group_id = 'utc-1'")[0]["ts"],
+            warehouse.query("SELECT _loaded_at AS ts FROM silver_groups WHERE group_id = 'utc-1'")[0]["ts"],
+            warehouse.query("SELECT _loaded_at AS ts FROM gold_hourly_conversion WHERE _batch_id = 'utc-batch' LIMIT 1")[0]["ts"],
+        ]
+        runs = warehouse.query(
+            "SELECT started_at, finished_at FROM pipeline_runs WHERE batch_id = 'utc-batch'"
+        )
+        for row in runs:
+            stamps.append(row["started_at"])
+            stamps.append(row["finished_at"])
+        assert stamps
+        for stamp in stamps:
+            moment = _naive(stamp)
+            assert before <= moment <= after
+            assert abs((moment - local_now).total_seconds()) > 2 * 3600
+    finally:
+        warehouse.close()
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
+
+
+def test_chaos_metrics_are_rejected_and_conserved(tmp_path):
+    warehouse = DuckDBWarehouse(tmp_path / "chaos.duckdb")
+    try:
+        batch = Batch(
+            batch_id="CHAOS-20261122-1829",
+            source="test",
+            groups=[
+                _group("chaos-over", 100, 4800, 4800),
+                _group("chaos-negative", -250, -30, -40),
+                _group("chaos-neg-convert", 120, -15, 10),
+                _group("chaos-ok", 100, 8, 12),
+            ],
+            tickets=[],
+            deploys=[],
+            meta=[],
+            golden=[],
+            external=[],
+        )
+        result = ingest_batch(warehouse, batch)
+        assert result["status"] == "success"
+        assert _count(warehouse, "SELECT COUNT(*)::INTEGER AS n FROM silver_groups WHERE _batch_id = ?", [batch.batch_id]) == 1
+        reasons = {
+            row["reason"]
+            for row in warehouse.query(
+                "SELECT reason FROM silver_rejects WHERE _batch_id = ? AND source_table = 'bronze_groups'",
+                [batch.batch_id],
+            )
+        }
+        assert reasons == {"conversions_gt_sessions", "negative_count"}
+        assert reconciliation_errors(warehouse, batch.batch_id) == []
+        silver = warehouse.query(
+            "SELECT rows_in, rows_out, rows_rejected FROM pipeline_runs WHERE batch_id = ? AND layer = 'silver'",
+            [batch.batch_id],
+        )[0]
+        assert int(silver["rows_in"]) == int(silver["rows_out"]) + int(silver["rows_rejected"])
+        assert int(silver["rows_in"]) == 4
+        assert int(silver["rows_rejected"]) == 3
+    finally:
+        warehouse.close()
+
+
+def test_snowflake_lineage_sql_uses_utc_and_names_metric_rejects():
+    procedure = medallion_statements("procedure")[0]
+    folded = " ".join(procedure.split())
+    assert "CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ" in folded
+    assert ":= CURRENT_TIMESTAMP()" not in folded
+    assert "'negative_count'" in procedure
+    assert "'conversions_gt_sessions'" in procedure
+    dynamic = dynamic_table_sql("COMPUTE_WH")
+    assert "CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ" in " ".join(dynamic.split())
+    assert "n_attempt >= 0" in dynamic
 
 
 def test_task_ddl_is_a_single_load_staging_call():

@@ -127,12 +127,13 @@ def dynamic_table_sql(warehouse_name: str, *, sandbox: str = SANDBOX_QUALIFIED) 
         SELECT
             group_id, hour, platform, country, channel, payment_method, sku, app_version,
             n_sessions, n_convert, n_attempt,
-            CURRENT_TIMESTAMP() AS _loaded_at,
+            CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ AS _loaded_at,
             _batch_id
         FROM {sandbox}.BRONZE_GROUPS
         WHERE group_id IS NOT NULL
           AND n_sessions >= 0
           AND n_convert >= 0
+          AND n_attempt >= 0
           AND n_attempt >= n_convert
           AND n_sessions >= n_convert
     """.strip()
