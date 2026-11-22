@@ -748,34 +748,9 @@ def mirror_signals(warehouse, batch_id: str, loaded_at: datetime | None = None) 
     """Copy classifier output into silver, then aggregate the gold topic mart."""
     loaded_at = loaded_at or clock()
     promoted = promote_topics(warehouse, batch_id, loaded_at)
-    try:
-        events = warehouse.query("SELECT * FROM signals.external_events")
-    except Exception:
-        events = []
-    event_rows = [
-        {
-            "event_id": row["event_id"],
-            "case_id": row.get("case_id"),
-            "title": row.get("title"),
-            "summary": row.get("summary"),
-            "source_url": row.get("source_url"),
-            "source_type": row.get("source_type"),
-            "relevance": row.get("relevance"),
-            "observed_at": row.get("observed_at"),
-            "metric": row.get("metric"),
-            "provider": row.get("provider"),
-            "_loaded_at": loaded_at,
-            "_batch_id": batch_id,
-        }
-        for row in events
-    ]
-    _merge(
-        warehouse,
-        "silver_external_events",
-        list(event_rows[0].keys()) if event_rows else [],
-        ["event_id"],
-        event_rows,
-    )
+    from signal_service.pipeline.external_backfill import promote_legacy_external_events
+
+    landed_events = promote_legacy_external_events(warehouse)
     try:
         spend = warehouse.query("SELECT * FROM signals.spend_log")
     except Exception:
@@ -804,7 +779,7 @@ def mirror_signals(warehouse, batch_id: str, loaded_at: datetime | None = None) 
         )
     return {
         "topics": promoted["topics"],
-        "events": len(event_rows),
+        "events": landed_events["visible"],
         "aggregates": promoted["aggregates"],
     }
 
