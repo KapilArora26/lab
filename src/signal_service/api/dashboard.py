@@ -1,4 +1,8 @@
-"""Gold-only dashboard. Reads GOLD_* plus the PIPELINE_RUNS audit. Chat cannot write."""
+"""Gold-only dashboard. Reads GOLD_* plus the PIPELINE_RUNS audit.
+
+Chat cannot write warehouse rows. When agent launch is enabled, a confirmed
+tool call can open a pull request through the Cursor Cloud Agents API.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +12,13 @@ from datetime import date, datetime
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from signal_service.cloud_agents import (
+    TOOL_DEFINITIONS,
+    TOOL_SYSTEM,
+    execute_tool_call,
+    launch_cloud_agent,
+    launch_enabled,
+)
 from signal_service.paths import repo_root
 from signal_service.safety.cost import CircuitBreakerOpen
 from signal_service.safety.redaction import RedactionError, assert_redacted
@@ -18,6 +29,8 @@ PERSONAS = ("atlas", "sentinel", "diagnostician", "builder", "narrator")
 class ChatBody(BaseModel):
     persona: str = "narrator"
     message: str = Field(min_length=1, max_length=2000)
+    confirm: bool = False
+    launch_task: str | None = Field(default=None, max_length=2000)
 
 
 def _cell(value):
@@ -207,9 +220,40 @@ def mock_answer(summary: dict) -> str:
     )
 
 
-def answer(warehouse, client, persona: str, message: str) -> dict:
+def _from_tool(client, persona: str, result: dict) -> dict:
+    reply = str(result.get("message") or "Cloud agent request failed.")
+    task = result.get("task")
+    if result.get("status") == "confirmation_required" and task:
+        reply = f"{reply}\n\nTask: {task}"
+    assert_redacted(reply)
+    payload = {
+        "provider": getattr(client, "provider", "mock"),
+        "persona": persona,
+        "reply": reply,
+        "tool_result": result,
+    }
+    if result.get("status") == "confirmation_required" and task:
+        payload["pending_launch"] = {"task": task}
+    return payload
+
+
+def answer(
+    warehouse,
+    client,
+    persona: str,
+    message: str,
+    *,
+    confirm: bool = False,
+    launch_task: str | None = None,
+) -> dict:
     """Read gold, then ask the model. This function does not land or change rows."""
     assert_redacted(message)
+    if persona not in PERSONAS:
+        raise ValueError(f"unknown persona {persona}")
+    if launch_task is not None and str(launch_task).strip():
+        assert_redacted(launch_task)
+        result = launch_cloud_agent(str(launch_task), confirmed=confirm)
+        return _from_tool(client, persona, result)
     summary = _summary(collect(warehouse))
     system = (
         _persona_text(persona)
@@ -217,13 +261,28 @@ def answer(warehouse, client, persona: str, message: str) -> dict:
         + "Do not invent numbers. Do not ask to load data or change the warehouse.\n"
         + json.dumps(summary, default=str)
     )
+    provider = getattr(client, "provider", "mock")
+    if provider == "grok" and launch_enabled():
+        system = system + "\n\n" + TOOL_SYSTEM
     assert_redacted(system)
-    if getattr(client, "provider", "mock") != "grok":
+    if provider != "grok":
         reply = mock_answer(summary)
+    elif launch_enabled():
+        completed = client.complete(system=system, user=message, tools=TOOL_DEFINITIONS)
+        tool_calls = completed.get("tool_calls") or []
+        if tool_calls:
+            result = execute_tool_call(tool_calls[0])
+            payload = _from_tool(client, persona, result)
+            content = completed.get("content") or ""
+            if content:
+                payload["reply"] = content + "\n\n" + payload["reply"]
+                assert_redacted(payload["reply"])
+            return payload
+        reply = completed.get("content") or ""
     else:
         reply = client.chat(system=system, user=message)
     assert_redacted(reply)
-    return {"provider": getattr(client, "provider", "mock"), "persona": persona, "reply": reply}
+    return {"provider": provider, "persona": persona, "reply": reply}
 
 
 def _page(data: dict) -> str:
@@ -312,6 +371,7 @@ def _page(data: dict) -> str:
       <label>Persona <select id="persona">{options}</select></label>
       <textarea id="message" placeholder="What changed in Android India checkout?"></textarea>
       <button id="ask" type="button">Ask</button>
+      <button id="confirm-launch" type="button" hidden>Confirm cloud agent launch</button>
       <p id="reply"></p>
     </section>
   </main>
@@ -403,6 +463,18 @@ def _page(data: dict) -> str:
       }}
       await refresh();
     }});
+    let pendingTask = '';
+    function showReply(body) {{
+      document.getElementById('reply').textContent = body.reply || body.detail || 'No reply';
+      const confirmLaunch = document.getElementById('confirm-launch');
+      if (body.pending_launch && body.pending_launch.task) {{
+        pendingTask = body.pending_launch.task;
+        confirmLaunch.hidden = false;
+      }} else {{
+        pendingTask = '';
+        confirmLaunch.hidden = true;
+      }}
+    }}
     document.getElementById('ask').addEventListener('click', async () => {{
       const persona = document.getElementById('persona').value;
       const message = document.getElementById('message').value;
@@ -411,8 +483,21 @@ def _page(data: dict) -> str:
         headers: {{ 'Content-Type': 'application/json' }},
         body: JSON.stringify({{ persona, message }})
       }});
-      const body = await response.json();
-      document.getElementById('reply').textContent = body.reply || body.detail || 'No reply';
+      showReply(await response.json());
+    }});
+    document.getElementById('confirm-launch').addEventListener('click', async () => {{
+      if (!pendingTask) return;
+      const confirmLaunch = document.getElementById('confirm-launch');
+      confirmLaunch.disabled = true;
+      const persona = document.getElementById('persona').value;
+      const message = document.getElementById('message').value || pendingTask;
+      const response = await fetch('/v1/dashboard/chat', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ persona, message, confirm: true, launch_task: pendingTask }})
+      }});
+      showReply(await response.json());
+      confirmLaunch.disabled = false;
     }});
     draw(initial);
     setInterval(refresh, 60000);
@@ -449,7 +534,14 @@ def register_dashboard(app: FastAPI, warehouse_fn, client_fn) -> None:
     @app.post("/v1/dashboard/chat")
     def dashboard_chat(body: ChatBody):
         try:
-            return answer(warehouse_fn(), client_fn(), body.persona, body.message)
+            return answer(
+                warehouse_fn(),
+                client_fn(),
+                body.persona,
+                body.message,
+                confirm=body.confirm,
+                launch_task=body.launch_task,
+            )
         except RedactionError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except ValueError as exc:

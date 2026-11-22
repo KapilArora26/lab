@@ -294,10 +294,55 @@ class LiveGrokClient:
             output_tokens,
             text_hash(prompt)[:16],
         )
-        content = str((body.get("choices") or [{}])[0].get("message", {}).get("content") or "")
-        parsed = ChatReply.model_validate({"reply": content.strip()})
+        raw_content = (body.get("choices") or [{}])[0].get("message", {}).get("content")
+        content = raw_content.strip() if isinstance(raw_content, str) else ""
+        parsed = ChatReply.model_validate({"reply": content})
         assert_redacted(parsed.reply)
         return parsed.reply
+
+    def complete(self, *, system: str, user: str, tools: list[dict] | None = None) -> dict:
+        """One chat completion. Returns assistant text and any tool calls."""
+        assert_redacted(system)
+        assert_redacted(user)
+        prompt = system + "\n" + user
+        estimated_input = max(1, len(prompt) // 4)
+        estimated = self.spend.estimate_tokens(estimated_input, 400)
+        payload: dict = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        response = self._post("/chat/completions", payload, estimated_usd=estimated)
+        body = response.json()
+        input_tokens, output_tokens = _usage(body)
+        self.spend.record(
+            self.spend.estimate_tokens(input_tokens or estimated_input, output_tokens or 200),
+            kind="dashboard_chat",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+        logger.info(
+            "grok_usage endpoint=/chat/completions input_tokens=%s output_tokens=%s input_hash=%s",
+            input_tokens,
+            output_tokens,
+            text_hash(prompt)[:16],
+        )
+        message = (body.get("choices") or [{}])[0].get("message") or {}
+        raw_content = message.get("content")
+        content = raw_content.strip() if isinstance(raw_content, str) else ""
+        tool_calls = message.get("tool_calls") or []
+        if content:
+            parsed = ChatReply.model_validate({"reply": content})
+            assert_redacted(parsed.reply)
+            content = parsed.reply
+        elif not tool_calls:
+            raise SchemaError("model response did not include a reply")
+        return {"content": content, "tool_calls": list(tool_calls)}
 
     def synthesize(self, text: str, language: str = "en") -> bytes | None:
         estimated = self.spend.estimate_speech(text)
