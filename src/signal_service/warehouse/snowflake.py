@@ -13,7 +13,7 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -21,8 +21,11 @@ import httpx
 
 from signal_service.config import DEFAULT_SNOWFLAKE_MCP_URL, SANDBOX_QUALIFIED
 
+# ALTER, MERGE, and CALL are not blanket-forbidden. ALTER is accepted only as
+# ALTER TASK <sandbox>.<task> RESUME (tasks are created suspended). MERGE and
+# CALL are accepted only as sandbox-scoped statements; see assert_sandbox_write.
 _FORBIDDEN = re.compile(
-    r"\b(drop|alter|truncate|undrop|grant|revoke|merge|call|copy|put|get|remove)\b",
+    r"\b(drop|truncate|undrop|grant|revoke|copy|put|get|remove)\b",
     re.IGNORECASE,
 )
 _STRING = re.compile(r"'(?:''|[^'])*'")
@@ -48,6 +51,32 @@ _KNOWN_TABLES = {
     "MEMORY_CAPABILITIES",
     "MEMORY_PREFERENCES",
     "MEMORY_LESSONS",
+    "BRONZE_GROUPS",
+    "BRONZE_SUPPORT_TICKETS",
+    "BRONZE_DEPLOYS",
+    "BRONZE_DEMO_META",
+    "BRONZE_GOLDEN_TICKETS",
+    "BRONZE_EXTERNAL_EVENTS",
+    "SILVER_GROUPS",
+    "SILVER_SESSIONS",
+    "SILVER_PAYMENTS",
+    "SILVER_ORDERS",
+    "SILVER_SUPPORT_TICKETS",
+    "SILVER_DEPLOYS",
+    "SILVER_DEMO_META",
+    "SILVER_GOLDEN_TICKETS",
+    "SILVER_TICKET_TOPICS",
+    "SILVER_EXTERNAL_EVENTS",
+    "SILVER_SPEND",
+    "SILVER_REJECTS",
+    "GOLD_HOURLY_CONVERSION",
+    "GOLD_REVENUE_AT_RISK",
+    "GOLD_CASE_FACTS",
+    "GOLD_TICKET_TOPICS",
+    "GOLD_DAILY_SPEND",
+    "GOLD_HEALTH",
+    "GOLD_PIPELINE_LAG",
+    "PIPELINE_RUNS",
 }
 _RETRY_STATUS = {429, 502, 503, 504}
 
@@ -116,6 +145,8 @@ def _literal(value: Any) -> str:
         if stamp.tzinfo is not None:
             stamp = stamp.astimezone(timezone.utc).replace(tzinfo=None)
         return f"'{stamp.strftime('%Y-%m-%d %H:%M:%S')}'::TIMESTAMP_NTZ"
+    if isinstance(value, date):
+        return f"'{value.isoformat()}'::DATE"
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
@@ -208,6 +239,16 @@ def prepare_sql(sql: str, params: list | None = None, sandbox: str = SANDBOX_QUA
     return rewrite_for_sandbox(bind_params(_strip(sql), params), sandbox)
 
 
+def _mask_dollar(sql: str) -> str:
+    """Hide procedure and task bodies so semicolons inside $$ are not splits."""
+    return re.sub(r"\$\$.*?\$\$", "$$", sql, flags=re.DOTALL)
+
+
+def _top_level_semicolon(sql: str) -> bool:
+    masked = _mask_strings(_mask_dollar(sql))
+    return ";" in masked
+
+
 def _chains(sql: str) -> list[list[str]]:
     found: list[list[str]] = []
     for match in _CHAIN.finditer(_mask_strings(sql)):
@@ -243,7 +284,7 @@ def assert_read_sql(sql: str) -> str:
     guarded = _mask_strings(text)
     if not text:
         raise UnsafeSQL("empty SQL")
-    if ";" in guarded:
+    if _top_level_semicolon(text):
         raise UnsafeSQL("multiple statements are refused")
     if _FORBIDDEN.search(guarded):
         raise UnsafeSQL("statement contains a forbidden keyword")
@@ -257,12 +298,14 @@ def assert_sandbox_write(sql: str, sandbox: str = SANDBOX_QUALIFIED) -> str:
     guarded = _mask_strings(text)
     if not text:
         raise UnsafeSQL("empty SQL")
-    if ";" in guarded:
+    if _top_level_semicolon(text):
         raise UnsafeSQL("multiple statements are refused")
     if _FORBIDDEN.search(guarded):
-        raise UnsafeSQL("DROP, ALTER, and other destructive statements are refused")
-    if not re.match(r"(?is)^(create|insert|update|delete)\b", text):
-        raise UnsafeSQL("write path accepts CREATE, INSERT, UPDATE, or DELETE")
+        raise UnsafeSQL("DROP, TRUNCATE, GRANT, and other destructive statements are refused")
+    if not re.match(r"(?is)^(create|insert|update|delete|merge|call|alter)\b", text):
+        raise UnsafeSQL(
+            "write path accepts CREATE, INSERT, UPDATE, DELETE, MERGE, CALL, or ALTER TASK RESUME"
+        )
     upper_sandbox = sandbox.upper()
     upper = " ".join(text.upper().split())
     if re.match(r"(?is)^create\s+schema\b", text):
@@ -272,8 +315,38 @@ def assert_sandbox_write(sql: str, sandbox: str = SANDBOX_QUALIFIED) -> str:
         return text
     if upper_sandbox not in upper:
         raise UnsafeSQL(f"writes must be fully qualified to {sandbox}")
+    _assert_created_object_qualified(text, sandbox)
+    _assert_alter_or_call(text, sandbox)
     _assert_no_foreign_refs(text, sandbox)
     return text
+
+
+def _assert_created_object_qualified(text: str, sandbox: str) -> None:
+    match = re.match(
+        r"(?is)^create\s+(?:or\s+replace\s+)?(?:stream|task|dynamic\s+table|procedure)\s+"
+        r"(?:if\s+not\s+exists\s+)?([A-Za-z0-9_.]+)",
+        text,
+    )
+    if match is None:
+        return
+    name = match.group(1)
+    if not name.upper().startswith(sandbox.upper() + "."):
+        raise UnsafeSQL(f"{name} must be created inside {sandbox}")
+    if re.match(r"(?is)^create\s+(?:or\s+replace\s+)?procedure\b", text):
+        if f"{sandbox.upper()}.LOAD_STAGING" not in " ".join(text.upper().split()):
+            raise UnsafeSQL(f"only procedure {sandbox}.LOAD_STAGING may be created")
+
+
+def _assert_alter_or_call(text: str, sandbox: str) -> None:
+    collapsed = " ".join(text.split())
+    if re.match(r"(?is)^alter\b", collapsed):
+        pattern = rf"(?is)^alter\s+task\s+{re.escape(sandbox)}\.[A-Za-z_][A-Za-z0-9_]*\s+resume$"
+        if not re.match(pattern, collapsed):
+            raise UnsafeSQL(f"only ALTER TASK {sandbox}.<task> RESUME is allowed")
+    if re.match(r"(?is)^call\b", collapsed):
+        pattern = rf"(?is)^call\s+{re.escape(sandbox)}\.LOAD_STAGING\s*\("
+        if not re.match(pattern, collapsed):
+            raise UnsafeSQL(f"only CALL {sandbox}.LOAD_STAGING is allowed")
 
 
 def _parse_timestamp(value: Any) -> datetime:

@@ -54,7 +54,7 @@ def series_sql(metric: str, segment: dict[str, str]) -> tuple[str, list]:
             SELECT date_trunc('hour', ts) AS bucket,
                    count(*)::DOUBLE AS volume,
                    sum(CASE WHEN converted THEN 1 ELSE 0 END)::DOUBLE AS positives
-            FROM sessions
+            FROM silver_sessions
             {where}
             GROUP BY 1
             ORDER BY 1
@@ -65,7 +65,7 @@ def series_sql(metric: str, segment: dict[str, str]) -> tuple[str, list]:
             SELECT date_trunc('hour', ts) AS bucket,
                    count(*)::DOUBLE AS volume,
                    sum(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END)::DOUBLE AS positives
-            FROM payments
+            FROM silver_payments
             {where}
             GROUP BY 1
             ORDER BY 1
@@ -93,7 +93,7 @@ def load_series(warehouse, metric: str, segment: dict[str, str]) -> tuple[list[H
 
 def _meta_float(warehouse, key: str, default: float) -> float:
     try:
-        rows = warehouse.query("SELECT value FROM demo_meta WHERE key = ?", [key])
+        rows = warehouse.query("SELECT value FROM silver_demo_meta WHERE key = ?", [key])
     except Exception:
         return default
     if not rows:
@@ -103,7 +103,7 @@ def _meta_float(warehouse, key: str, default: float) -> float:
 
 def _aov(warehouse, segment: dict[str, str]) -> float:
     where, params = _filters(segment)
-    sql = f"SELECT avg(amount_usd)::DOUBLE AS aov FROM orders {where}"
+    sql = f"SELECT avg(amount_usd)::DOUBLE AS aov FROM silver_orders {where}"
     rows = warehouse.query(sql, params)
     if rows and rows[0]["aov"] is not None:
         return float(rows[0]["aov"])

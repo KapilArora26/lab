@@ -2,6 +2,9 @@
 -- Snowflake writes are allowed only in MCP_DB.SIGNAL_SANDBOX (see the adapter).
 -- The migration that creates the sandbox, demo tables, and expansion views is
 -- sql/snowflake/001_sandbox.sql.
+-- Medallion tables (BRONZE_*, SILVER_*, GOLD_*, PIPELINE_RUNS, GOLD_PIPELINE_LAG)
+-- are created by sql/snowflake/002_medallion.sql. Silver and gold rows carry
+-- _loaded_at and _batch_id. Bronze rows carry _ingested_at, _source, and _batch_id.
 
 CREATE SCHEMA IF NOT EXISTS signals;
 

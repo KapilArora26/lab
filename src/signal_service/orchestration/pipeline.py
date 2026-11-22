@@ -116,6 +116,9 @@ def run_pipeline(
             topics=load_topics(warehouse, primary["case_id"]),
             external=external_run["items"],
         )
+        from signal_service.pipeline.propagate import mirror_signals
+
+        mirror_signals(warehouse, batch_id=f"signals-{primary['case_id']}")
 
     note = quiet_hours_note(memory.preferences(), primary["severity"], _parse(primary["started_at"]))
     brief = exec_brief(primary, pack, quiet_hours_note=note)
@@ -129,6 +132,9 @@ def run_pipeline(
     charts = chart_specs(primary, series, pack.get("slices") or {})
     case_file = build_case_file(primary, pack, approvals)
     memory.update_case(primary["case_id"], status="briefed", payload=case_file)
+    from signal_service.pipeline.propagate import sync_case_facts
+
+    sync_case_facts(warehouse, batch_id=f"cases-{primary['case_id']}")
     cases = memory.open_cases()
     week = weekly_review_page(cases, week_label="2026-11-16")
     cost = estimate_batch_cost(

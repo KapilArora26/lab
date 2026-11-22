@@ -8,11 +8,12 @@ risk back toward the production volume the case is meant to represent.
 
 from __future__ import annotations
 
+import json
 import math
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from signal_service.warehouse.duckdb import DuckDBWarehouse
+from signal_service.paths import data_path
 
 START = datetime(2026, 11, 8, 0, 0, 0)
 END = datetime(2026, 11, 20, 8, 0, 0)
@@ -73,9 +74,9 @@ def _hours() -> list[datetime]:
     return hours
 
 
-def group_rows() -> list[tuple]:
+def group_rows(hours: list[datetime] | None = None) -> list[tuple]:
     rows = []
-    for hour in _hours():
+    for hour in _hours() if hours is None else hours:
         for index, segment in enumerate(SEGMENTS):
             platform, country, channel, payment, sku, version, sessions, anomalous = segment
             rate = hourly_rate(hour, anomalous)
@@ -197,124 +198,37 @@ def meta_rows() -> list[tuple]:
     ]
 
 
+def golden_rows() -> list[tuple]:
+    rows: list[tuple] = []
+    for line in data_path("golden", "tickets.jsonl").read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        item = json.loads(line)
+        rows.append(
+            (
+                item["id"],
+                item["text"],
+                item["topic"],
+                item["sentiment"],
+                item["severity"],
+                item["product_area"],
+            )
+        )
+    return rows
+
+
 def build_demo(path: str | Path) -> Path:
+    """Create a DuckDB file and land the seed batch through the medallion ingest."""
     destination = Path(path)
     if destination.exists():
         destination.unlink()
+    from signal_service.pipeline.ingest import ingest_seed
+    from signal_service.warehouse.duckdb import DuckDBWarehouse
+
     warehouse = DuckDBWarehouse(destination)
-    connection = warehouse.connection
-    connection.execute(
-        """
-        CREATE TABLE groups (
-            group_id VARCHAR,
-            hour TIMESTAMP,
-            platform VARCHAR,
-            country VARCHAR,
-            channel VARCHAR,
-            payment_method VARCHAR,
-            sku VARCHAR,
-            app_version VARCHAR,
-            n_sessions INTEGER,
-            n_convert INTEGER,
-            n_attempt INTEGER
-        )
-        """
-    )
-    connection.executemany("INSERT INTO groups VALUES (?,?,?,?,?,?,?,?,?,?,?)", group_rows())
-    connection.execute(
-        """
-        CREATE TABLE sessions AS
-        SELECT
-            's-' || g.group_id || '-' || r.range::VARCHAR AS session_id,
-            g.hour AS ts,
-            g.platform,
-            g.country,
-            g.channel,
-            g.payment_method,
-            g.sku,
-            g.app_version,
-            r.range < g.n_convert AS converted
-        FROM groups g, range(g.n_sessions::BIGINT) r
-        """
-    )
-    connection.execute(
-        """
-        CREATE TABLE payments AS
-        SELECT
-            'p-' || g.group_id || '-' || r.range::VARCHAR AS payment_id,
-            CASE WHEN r.range < g.n_convert
-                 THEN 'o-' || g.group_id || '-' || r.range::VARCHAR
-                 ELSE NULL END AS order_id,
-            g.hour AS ts,
-            g.payment_method AS method,
-            CASE WHEN g.payment_method = 'upi' THEN 'razorpay_upi' ELSE 'stripe' END AS gateway,
-            CASE WHEN r.range < g.n_convert THEN 'succeeded' ELSE 'failed' END AS status,
-            CASE
-                WHEN r.range < g.n_convert THEN NULL
-                WHEN g.payment_method = 'upi' THEN 'UPI_OTP_TIMEOUT'
-                ELSE 'CARD_DECLINED'
-            END AS error_code,
-            ?::DOUBLE AS amount_usd,
-            g.platform,
-            g.country,
-            g.app_version
-        FROM groups g, range(g.n_attempt::BIGINT) r
-        """,
-        [ORDER_AMOUNT],
-    )
-    connection.execute(
-        """
-        CREATE TABLE orders AS
-        SELECT
-            'o-' || g.group_id || '-' || r.range::VARCHAR AS order_id,
-            's-' || g.group_id || '-' || r.range::VARCHAR AS session_id,
-            g.hour AS ts,
-            g.platform,
-            g.country,
-            g.channel,
-            g.payment_method,
-            g.sku,
-            g.app_version,
-            ?::DOUBLE AS amount_usd,
-            'paid' AS status
-        FROM groups g, range(g.n_convert::BIGINT) r
-        """,
-        [ORDER_AMOUNT],
-    )
-    connection.execute(
-        """
-        CREATE TABLE support_tickets (
-            ticket_id VARCHAR,
-            ts TIMESTAMP,
-            platform VARCHAR,
-            country VARCHAR,
-            channel VARCHAR,
-            payment_method VARCHAR,
-            sku VARCHAR,
-            app_version VARCHAR,
-            product_area VARCHAR,
-            text_redacted VARCHAR
-        )
-        """
-    )
-    connection.executemany(
-        "INSERT INTO support_tickets VALUES (?,?,?,?,?,?,?,?,?,?)",
-        ticket_rows(),
-    )
-    connection.execute(
-        """
-        CREATE TABLE deploys (
-            deploy_id VARCHAR,
-            deployed_at TIMESTAMP,
-            platform VARCHAR,
-            app_version VARCHAR,
-            note VARCHAR
-        )
-        """
-    )
-    connection.executemany("INSERT INTO deploys VALUES (?,?,?,?,?)", deploy_rows())
-    connection.execute("CREATE TABLE demo_meta (key VARCHAR, value VARCHAR)")
-    connection.executemany("INSERT INTO demo_meta VALUES (?, ?)", meta_rows())
-    connection.execute("CHECKPOINT")
-    warehouse.close()
+    try:
+        ingest_seed(warehouse)
+        warehouse.connection.execute("CHECKPOINT")
+    finally:
+        warehouse.close()
     return destination
