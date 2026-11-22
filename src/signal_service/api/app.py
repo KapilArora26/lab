@@ -11,6 +11,7 @@ from signal_service.demo.generate import build_demo
 from signal_service.eval.harness import run_eval
 from signal_service.grok.client import LiveGrokClient, MockGrokClient
 from signal_service.orchestration.pipeline import _guard, run_pipeline
+from signal_service.api.dashboard import register_dashboard
 from signal_service.pipeline.ingest import ingest
 from signal_service.pipeline.propagate import PipelineError
 from signal_service.safety.cost import CircuitBreakerOpen
@@ -114,4 +115,5 @@ def create_app(warehouse: DuckDBWarehouse | None = None) -> FastAPI:
             raise HTTPException(status_code=500, detail=report)
         return report
 
+    register_dashboard(app, warehouse_or_create, lambda: _client(settings))
     return app

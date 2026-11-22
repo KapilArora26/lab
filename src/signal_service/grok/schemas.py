@@ -26,6 +26,12 @@ class TicketBatch(BaseModel):
     items: list[TicketClassification]
 
 
+class ChatReply(BaseModel):
+    """Plain-text dashboard reply. The model is not asked to call tools or write data."""
+
+    reply: str = Field(min_length=1, max_length=4000)
+
+
 class ExternalSignal(BaseModel):
     title: str
     summary: str

@@ -7,7 +7,13 @@ from typing import Protocol
 
 import httpx
 
-from signal_service.grok.schemas import ExternalBatch, ExternalSignal, TicketBatch, ticket_response_schema
+from signal_service.grok.schemas import (
+    ChatReply,
+    ExternalBatch,
+    ExternalSignal,
+    TicketBatch,
+    ticket_response_schema,
+)
 from signal_service.hashing import text_hash
 from signal_service.paths import data_path
 from signal_service.safety.cost import SpendGuard
@@ -36,6 +42,8 @@ class GrokClient(Protocol):
     def search(self, query: str) -> list[dict]: ...
 
     def synthesize(self, text: str, language: str = "en") -> bytes | None: ...
+
+    def chat(self, *, system: str, user: str) -> str: ...
 
 
 def _extract_json_object(text: str) -> dict:
@@ -258,6 +266,39 @@ class LiveGrokClient:
         parsed = ExternalBatch.model_validate(_extract_json_object(_output_text(body)))
         return keep_sourced(parsed.items)
 
+    def chat(self, *, system: str, user: str) -> str:
+        assert_redacted(system)
+        assert_redacted(user)
+        prompt = system + "\n" + user
+        estimated_input = max(1, len(prompt) // 4)
+        estimated = self.spend.estimate_tokens(estimated_input, 400)
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        }
+        response = self._post("/chat/completions", payload, estimated_usd=estimated)
+        body = response.json()
+        input_tokens, output_tokens = _usage(body)
+        self.spend.record(
+            self.spend.estimate_tokens(input_tokens or estimated_input, output_tokens or 200),
+            kind="dashboard_chat",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+        logger.info(
+            "grok_usage endpoint=/chat/completions input_tokens=%s output_tokens=%s input_hash=%s",
+            input_tokens,
+            output_tokens,
+            text_hash(prompt)[:16],
+        )
+        content = str((body.get("choices") or [{}])[0].get("message", {}).get("content") or "")
+        parsed = ChatReply.model_validate({"reply": content.strip()})
+        assert_redacted(parsed.reply)
+        return parsed.reply
+
     def synthesize(self, text: str, language: str = "en") -> bytes | None:
         estimated = self.spend.estimate_speech(text)
         self.spend.authorize(estimated)
@@ -296,6 +337,11 @@ class MockGrokClient:
         raw = json.loads(data_path("fixtures", "external_signals.json").read_text(encoding="utf-8"))
         signals = [ExternalSignal.model_validate(item) for item in raw]
         return keep_sourced(signals)
+
+    def chat(self, *, system: str, user: str) -> str:
+        assert_redacted(system)
+        assert_redacted(user)
+        return ""
 
     def synthesize(self, text: str, language: str = "en") -> bytes | None:
         return None

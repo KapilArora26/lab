@@ -163,6 +163,35 @@ SELECT * FROM MCP_DB.SIGNAL_SANDBOX.GOLD_PIPELINE_LAG;
 
 `deploy-snowflake` applies `sql/snowflake/001_sandbox.sql` and `sql/snowflake/002_medallion.sql`, loads the seed batch through ingest, and checks GROUPS 2,960, SESSIONS 429,200, PAYMENTS 51,800, ORDERS 42,692, SUPPORT_TICKETS 92, and TICKET_TOPICS 73.
 
+## Dashboard
+
+`GET /dashboard` is a server-rendered page. Chart.js loads from a CDN and the page refreshes from `GET /v1/dashboard/data` every 60 seconds. That JSON, and the page itself, read `GOLD_*` objects. Layer progress is the audit table, not an earlier layer. Chat is `POST /v1/dashboard/chat`. It uses the same Grok client, the key from `XAI_API_KEY`, the redaction check, and the daily spend cap. With no key it answers from the gold summary with the mock client. The chosen persona is one of `bots/atlas.md`, `sentinel.md`, `diagnostician.md`, `builder.md`, or `narrator.md`. Chat cannot land a batch or write a row.
+
+```text
+GET /dashboard
+    |
+    +-- gold health, conversion vs baseline, revenue at risk
+    +-- open cases, ticket topics, spend vs cap
+    +-- PIPELINE_RUNS  (freshness and the load-data progress)
+    |
+    +-- Load new data --> confirm --> POST /v1/ingest
+    |                         |
+    |                         +-- poll PIPELINE_RUNS for that batch
+    |
+    +-- Ask --> POST /v1/dashboard/chat --> gold summary + persona
+                (read only; mock when XAI_API_KEY is unset)
+```
+
+```bash
+python -m signal_service.cli serve --db data/warehouse/demo.duckdb
+```
+
+Open `http://127.0.0.1:8000/dashboard`. The monitor query is the same one the page polls:
+
+```sql
+SELECT * FROM MCP_DB.SIGNAL_SANDBOX.PIPELINE_RUNS ORDER BY started_at DESC;
+```
+
 ## Deploy to Snowflake
 
 The migrations are [`sql/snowflake/001_sandbox.sql`](sql/snowflake/001_sandbox.sql) and [`sql/snowflake/002_medallion.sql`](sql/snowflake/002_medallion.sql). They create only `MCP_DB.SIGNAL_SANDBOX`. `sessions`, `payments`, and `orders` are views over silver groups. They expand each group with `ARRAY_GENERATE_RANGE`, which is the same 0-based range the DuckDB generator materializes.
