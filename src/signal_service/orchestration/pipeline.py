@@ -69,6 +69,18 @@ def run_pipeline(
             "suppressed": guarded["suppressed"],
             "duplicates": guarded["duplicates"],
             "error": "no anomaly detected",
+            "spend": {
+                "recorded_usd": round(guard.spent_usd, 6),
+                "live_estimate_usd": {
+                    "classify_usd": 0.0,
+                    "search_usd": 0.0,
+                    "speech_usd": 0.0,
+                    "total_usd": 0.0,
+                    "ticket_count": 0,
+                    "assumptions": "no primary finding, so no model calls were made",
+                },
+                "provider": getattr(client, "provider", "mock"),
+            },
         }
     for alert in guarded["alerts"]:
         memory.save_case(alert, status="investigating", owner=assign_owner(alert["metric"]), payload=alert)
@@ -190,9 +202,11 @@ def _publish_signals(warehouse, case_id: str) -> None:
     Snowflake runs the MERGE inside ``LOAD_STAGING`` so the client does not
     read the bronze page. DuckDB merges in process.
     """
+    from signal_service.pipeline.external_backfill import promote_legacy_external_events
     from signal_service.pipeline.ingest import SEED_BATCH_ID
     from signal_service.pipeline.propagate import mirror_signals
 
+    promote_legacy_external_events(warehouse)
     batch_id = SEED_BATCH_ID
     try:
         rows = warehouse.query(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from signal_service.grok.client import MockGrokClient
 from signal_service.narrative.brief import weekly_review_page
 from signal_service.orchestration.pipeline import run_pipeline
@@ -65,13 +67,23 @@ def test_seeded_incident_end_to_end(demo_wh):
     assert result["build_spec"]["merge"] is False
 
 
-def test_second_sweep_dedupes_the_open_case(demo_wh):
+def test_second_sweep_dedupes_the_open_case(demo_wh, tmp_path):
+    from signal_service.cli import _write_demo
+
     first = run_pipeline(demo_wh, MockGrokClient(), simulate_build_approval=True)
     second = run_pipeline(demo_wh, MockGrokClient(), simulate_build_approval=True)
     assert first["case_card"]["case_id"].startswith("C-2026-1120-")
     assert second["error"] == "no anomaly detected"
     assert second["duplicates"]
     assert second["alerts"] == []
+    assert "case_card" not in second
+    assert second["spend"]["recorded_usd"] == 0
+    assert second["spend"]["live_estimate_usd"]["total_usd"] == 0
+    destination = tmp_path / "demo-run.json"
+    assert _write_demo(second, destination) == 1
+    saved = json.loads(destination.read_text(encoding="utf-8"))
+    assert saved["verify_pr"]["cost_estimate_usd"] == 0
+    assert saved["error"] == "no anomaly detected"
 
 
 def test_weekly_page_uses_only_case_fields():

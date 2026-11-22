@@ -529,6 +529,9 @@ def ensure_objects(warehouse) -> None:
     if getattr(warehouse, "backend", "duckdb") == "snowflake":
         for statement in medallion_statements("core"):
             warehouse.execute(statement)
-        return
-    for statement in duckdb_statements():
-        warehouse.execute(statement)
+    else:
+        for statement in duckdb_statements():
+            warehouse.execute(statement)
+    from signal_service.pipeline.external_backfill import promote_legacy_external_events
+
+    promote_legacy_external_events(warehouse)

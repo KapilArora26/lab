@@ -235,12 +235,13 @@ def _print_public_ip() -> None:
 def _write_demo(result: dict, destination: Path) -> int:
     evaluation = run_eval()
     result["eval"] = evaluation
+    live = (result.get("spend") or {}).get("live_estimate_usd") or {}
     result["verify_pr"] = {
         "merge": False,
         "eval_topic_accuracy": evaluation["accuracy"]["topic"],
         "eval_threshold": evaluation["topic_threshold"],
         "schema_diff": "signals.ticket_topics, signals.external_events, signals.spend_log",
-        "cost_estimate_usd": result["spend"]["live_estimate_usd"]["total_usd"],
+        "cost_estimate_usd": live.get("total_usd", 0),
         "note": "tests_passed is reported by CI. This command does not mark tests as passed.",
     }
     destination.parent.mkdir(parents=True, exist_ok=True)

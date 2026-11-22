@@ -418,6 +418,122 @@ def test_snowflake_lineage_sql_uses_utc_and_names_metric_rejects():
     assert "n_attempt >= 0" in dynamic
 
 
+def test_null_batch_consumes_streams_and_never_writes_pending():
+    procedure = medallion_statements("procedure")[0]
+    upper = procedure.upper()
+    assert "BEGIN TRANSACTION" in upper
+    assert "COMMIT" in upper
+    assert "'PENDING'" not in upper
+    assert "COALESCE(:V_BATCH, 'PENDING')" not in upper
+    insert_at = upper.find("INSERT INTO MCP_DB.SIGNAL_SANDBOX.STREAM_BATCH_QUEUE")
+    assert insert_at > 0
+    consumed = upper[insert_at:upper.find("IF (NOT EXISTS", insert_at)]
+    for stream in (
+        "STREAM_BRONZE_GROUPS",
+        "STREAM_BRONZE_SUPPORT_TICKETS",
+        "STREAM_BRONZE_DEPLOYS",
+        "STREAM_BRONZE_DEMO_META",
+        "STREAM_BRONZE_GOLDEN_TICKETS",
+        "STREAM_BRONZE_EXTERNAL_EVENTS",
+        "STREAM_SILVER_GROUPS",
+    ):
+        assert stream in consumed
+    assert "METADATA$ACTION" in consumed
+    assert "LAYER = 'GOLD'" in consumed
+    assert "STATUS = 'SUCCESS'" in consumed
+    assert "DELETE FROM MCP_DB.SIGNAL_SANDBOX.GOLD_DAILY_SPEND" in upper
+    assert "WHERE _BATCH_ID IN (SELECT BATCH_ID FROM MCP_DB.SIGNAL_SANDBOX.STREAM_BATCH_QUEUE)" in upper
+    assert "V_BATCH IS NULL OR" not in upper
+    assert re.search(r"LOAD_STAGING\s*\(\s*batch\s+VARCHAR\s*\)", procedure, re.IGNORECASE)
+
+
+def test_legacy_external_events_land_in_bronze_silver_and_gold(tmp_path):
+    from signal_service.pipeline.ddl import ensure_objects
+    from signal_service.pipeline.external_backfill import promote_legacy_external_events
+    from signal_service.signals.tables import ensure_signal_tables
+
+    warehouse = DuckDBWarehouse(tmp_path / "legacy.duckdb")
+    try:
+        ensure_objects(warehouse)
+        ensure_signal_tables(warehouse)
+        warehouse.execute(
+            """
+            INSERT INTO signals.external_events (
+                event_id, case_id, title, summary, source_url, source_type, relevance,
+                observed_at, metric, provider
+            ) VALUES
+            ('ext-legacy-1', 'C-1', 'UPI outage', 'Banks report failures', 'https://example.com/a', 'web', 0.9, TIMESTAMP '2026-11-20 02:00:00', 'checkout_conversion', 'mock'),
+            ('ext-legacy-1', 'C-1', 'UPI outage duplicate', 'Ignored duplicate id', 'https://example.com/a', 'web', 0.1, TIMESTAMP '2026-11-20 02:01:00', 'checkout_conversion', 'mock'),
+            ('ext-legacy-2', 'C-1', 'Status page', 'Elevated errors', 'https://example.com/b', 'x', 0.8, TIMESTAMP '2026-11-20 02:05:00', 'checkout_conversion', 'mock')
+            """
+        )
+        first = promote_legacy_external_events(warehouse)
+        assert first["inserted"] == 2
+        assert first["visible"] == 2
+        assert _count(warehouse, "SELECT COUNT(*)::INTEGER AS n FROM bronze_external_events") == 2
+        assert _count(warehouse, "SELECT COUNT(*)::INTEGER AS n FROM silver_external_events") == 2
+        assert _count(warehouse, "SELECT COUNT(*)::INTEGER AS n FROM gold_external_events") == 2
+        batches = {row["_batch_id"] for row in warehouse.query("SELECT _batch_id FROM gold_external_events")}
+        assert batches == {"legacy-external"}
+        second = promote_legacy_external_events(warehouse)
+        assert second["inserted"] == 0
+        assert _count(warehouse, "SELECT COUNT(*)::INTEGER AS n FROM bronze_external_events") == 2
+        assert _count(warehouse, "SELECT COUNT(*)::INTEGER AS n FROM gold_external_events") == 2
+    finally:
+        warehouse.close()
+
+
+def test_legacy_external_events_join_an_existing_bronze_batch(demo_wh):
+    from signal_service.pipeline.external_backfill import promote_legacy_external_events
+    from signal_service.signals.tables import ensure_signal_tables
+
+    demo_wh.execute("DELETE FROM bronze_external_events")
+    demo_wh.execute("DELETE FROM silver_external_events")
+    ensure_signal_tables(demo_wh)
+    demo_wh.execute("DELETE FROM signals.external_events")
+    demo_wh.execute(
+        """
+        INSERT INTO signals.external_events (
+            event_id, case_id, title, summary, source_url, source_type, relevance,
+            observed_at, metric, provider
+        ) VALUES
+        ('ext-open-1', 'C-2026-1120-001', 'UPI outage', 'Banks report failures', 'https://example.com/a', 'web', 0.9, TIMESTAMP '2026-11-20 02:00:00', 'checkout_conversion', 'mock'),
+        ('ext-open-2', 'C-2026-1120-001', 'Status page', 'Elevated errors', 'https://example.com/b', 'x', 0.8, TIMESTAMP '2026-11-20 02:05:00', 'checkout_conversion', 'mock')
+        """
+    )
+    landed = promote_legacy_external_events(demo_wh)
+    assert landed["inserted"] == 2
+    assert landed["visible"] == 2
+    assert _count(demo_wh, "SELECT COUNT(*)::INTEGER AS n FROM bronze_external_events") == 2
+    assert _count(demo_wh, "SELECT COUNT(*)::INTEGER AS n FROM silver_external_events") == 2
+    assert _count(demo_wh, "SELECT COUNT(*)::INTEGER AS n FROM gold_external_events") == 2
+    batches = {row["_batch_id"] for row in demo_wh.query("SELECT _batch_id FROM gold_external_events")}
+    assert batches == {SEED_BATCH_ID}
+    again = promote_legacy_external_events(demo_wh)
+    assert again["inserted"] == 0
+    assert _count(demo_wh, "SELECT COUNT(*)::INTEGER AS n FROM bronze_external_events") == 2
+
+
+def test_external_backfill_sql_is_idempotent_and_sandbox_scoped():
+    from signal_service.pipeline.ingest import SEED_BATCH_ID as seed_batch
+    from signal_service.warehouse.snowflake import assert_sandbox_write
+
+    statements = medallion_statements("external_backfill")
+    assert len(statements) == 2
+    blob = " ".join(statements)
+    folded = " ".join(blob.upper().split())
+    assert "INSERT INTO MCP_DB.SIGNAL_SANDBOX.BRONZE_EXTERNAL_EVENTS" in folded
+    assert "MERGE INTO MCP_DB.SIGNAL_SANDBOX.SILVER_EXTERNAL_EVENTS" in folded
+    assert "NOT EXISTS" in folded
+    assert "WHEN NOT MATCHED" in folded
+    assert seed_batch in blob
+    assert "legacy-external" in blob
+    assert re.search(r"(?i)\bdrop\b", blob) is None
+    assert re.search(r"(?i)\btruncate\b", blob) is None
+    for statement in statements:
+        assert_sandbox_write(statement)
+
+
 def test_task_ddl_is_a_single_load_staging_call():
     tasks = medallion_statements("task")
     assert len(tasks) == 2
