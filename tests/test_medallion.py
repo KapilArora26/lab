@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+import os
+import re
+import time
+
+import pytest
+from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
 
 from signal_service.api.app import create_app
 from signal_service.pipeline.ddl import medallion_statements
-from signal_service.pipeline.ingest import SEED_BATCH_ID, Batch, ingest, ingest_seed, rerun_batch
-from signal_service.pipeline.mode import ModeReport, install_event_driven
+from signal_service.pipeline.ingest import SEED_BATCH_ID, Batch, ingest, ingest_batch, ingest_seed, rerun_batch
+from signal_service.pipeline.mode import ModeReport, ProcedureCompileError, dynamic_table_sql, install_event_driven
 from signal_service.pipeline.reconcile import reconciliation_errors
 from signal_service.safety.redaction import pii_kinds
+from signal_service.warehouse.duckdb import DuckDBWarehouse
 
 
 def _count(warehouse, sql: str, params: list | None = None) -> int:
@@ -158,7 +164,7 @@ def test_data_quality_and_pii_stay_out_of_silver_and_gold(demo_wh, tmp_path):
         row["reason"]
         for row in demo_wh.query("SELECT reason FROM silver_rejects WHERE _batch_id = 'dq-batch'")
     }
-    assert "n_convert exceeds n_sessions" in reasons
+    assert "conversions_gt_sessions" in reasons
     assert any(reason.startswith("pii:") for reason in reasons)
     email = "jane.doe@example.com"
     bronze = demo_wh.query("SELECT text_redacted FROM bronze_support_tickets WHERE ticket_id = 't-pii'")
@@ -287,6 +293,131 @@ def test_rerun_keeps_bronze_and_replaces_a_false_success(demo_wh):
     assert reconciliation_errors(demo_wh, SEED_BATCH_ID, expect_topics=73, expect_external=2) == []
 
 
+def _naive(value) -> datetime:
+    if isinstance(value, datetime):
+        stamp = value
+    else:
+        stamp = datetime.fromisoformat(str(value).replace("Z", ""))
+    if stamp.tzinfo is not None:
+        stamp = stamp.astimezone(timezone.utc).replace(tzinfo=None)
+    return stamp.replace(microsecond=0)
+
+
+def _group(group_id: str, sessions: int, converted: int, attempts: int) -> tuple:
+    return (
+        group_id,
+        datetime(2026, 11, 22, 18, 0, 0),
+        "android",
+        "IN",
+        "app",
+        "upi",
+        "SKU-100",
+        "4.2.1",
+        sessions,
+        converted,
+        attempts,
+    )
+
+
+def test_lineage_timestamps_stay_utc_when_the_process_zone_is_pacific(tmp_path):
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = "America/Los_Angeles"
+    time.tzset()
+    warehouse = DuckDBWarehouse(tmp_path / "utc.duckdb")
+    try:
+        before = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0) - timedelta(seconds=1)
+        batch = Batch(
+            batch_id="utc-batch",
+            source="test",
+            groups=[_group("utc-1", 40, 4, 6)],
+            tickets=[],
+            deploys=[],
+            meta=[],
+            golden=[],
+            external=[],
+        )
+        result = ingest_batch(warehouse, batch)
+        after = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0) + timedelta(seconds=1)
+        assert result["status"] == "success"
+        local_now = datetime.now().replace(tzinfo=None)
+        stamps = [
+            warehouse.query("SELECT _ingested_at AS ts FROM bronze_groups WHERE group_id = 'utc-1'")[0]["ts"],
+            warehouse.query("SELECT _loaded_at AS ts FROM silver_groups WHERE group_id = 'utc-1'")[0]["ts"],
+            warehouse.query("SELECT _loaded_at AS ts FROM gold_hourly_conversion WHERE _batch_id = 'utc-batch' LIMIT 1")[0]["ts"],
+        ]
+        runs = warehouse.query(
+            "SELECT started_at, finished_at FROM pipeline_runs WHERE batch_id = 'utc-batch'"
+        )
+        for row in runs:
+            stamps.append(row["started_at"])
+            stamps.append(row["finished_at"])
+        assert stamps
+        for stamp in stamps:
+            moment = _naive(stamp)
+            assert before <= moment <= after
+            assert abs((moment - local_now).total_seconds()) > 2 * 3600
+    finally:
+        warehouse.close()
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
+
+
+def test_chaos_metrics_are_rejected_and_conserved(tmp_path):
+    warehouse = DuckDBWarehouse(tmp_path / "chaos.duckdb")
+    try:
+        batch = Batch(
+            batch_id="CHAOS-20261122-1829",
+            source="test",
+            groups=[
+                _group("chaos-over", 100, 4800, 4800),
+                _group("chaos-negative", -250, -30, -40),
+                _group("chaos-neg-convert", 120, -15, 10),
+                _group("chaos-ok", 100, 8, 12),
+            ],
+            tickets=[],
+            deploys=[],
+            meta=[],
+            golden=[],
+            external=[],
+        )
+        result = ingest_batch(warehouse, batch)
+        assert result["status"] == "success"
+        assert _count(warehouse, "SELECT COUNT(*)::INTEGER AS n FROM silver_groups WHERE _batch_id = ?", [batch.batch_id]) == 1
+        reasons = {
+            row["reason"]
+            for row in warehouse.query(
+                "SELECT reason FROM silver_rejects WHERE _batch_id = ? AND source_table = 'bronze_groups'",
+                [batch.batch_id],
+            )
+        }
+        assert reasons == {"conversions_gt_sessions", "negative_count"}
+        assert reconciliation_errors(warehouse, batch.batch_id) == []
+        silver = warehouse.query(
+            "SELECT rows_in, rows_out, rows_rejected FROM pipeline_runs WHERE batch_id = ? AND layer = 'silver'",
+            [batch.batch_id],
+        )[0]
+        assert int(silver["rows_in"]) == int(silver["rows_out"]) + int(silver["rows_rejected"])
+        assert int(silver["rows_in"]) == 4
+        assert int(silver["rows_rejected"]) == 3
+    finally:
+        warehouse.close()
+
+
+def test_snowflake_lineage_sql_uses_utc_and_names_metric_rejects():
+    procedure = medallion_statements("procedure")[0]
+    folded = " ".join(procedure.split())
+    assert "CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ" in folded
+    assert ":= CURRENT_TIMESTAMP()" not in folded
+    assert "'negative_count'" in procedure
+    assert "'conversions_gt_sessions'" in procedure
+    dynamic = dynamic_table_sql("COMPUTE_WH")
+    assert "CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ" in " ".join(dynamic.split())
+    assert "n_attempt >= 0" in dynamic
+
+
 def test_task_ddl_is_a_single_load_staging_call():
     tasks = medallion_statements("task")
     assert len(tasks) == 2
@@ -297,12 +428,63 @@ def test_task_ddl_is_a_single_load_staging_call():
         assert " BEGIN " not in f" {folded} "
         assert folded.count(" CALL ") == 1
         assert "CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(NULL)" in folded
-    procedure = medallion_statements("procedure")[0].upper()
-    assert "RERUN BOOLEAN" in procedure
-    assert "SILVER_TICKET_TOPICS" in procedure
-    assert "GOLD_TICKET_TOPICS" in procedure
-    assert "BRONZE_EXTERNAL_EVENTS" in procedure
-    assert "SILVER_EXTERNAL_EVENTS" in procedure
+    procedures = medallion_statements("procedure")
+    assert len(procedures) == 2
+    load_staging = procedures[0]
+    rerun_staging = procedures[1]
+    assert re.search(r"LOAD_STAGING\s*\(\s*batch\s+VARCHAR\s*\)", load_staging, re.IGNORECASE)
+    assert "DEFAULT" not in load_staging.split("$$", 1)[0].upper()
+    assert re.search(r"RERUN_STAGING\s*\(\s*batch\s+VARCHAR\s*\)", rerun_staging, re.IGNORECASE)
+    assert "SILVER_TICKET_TOPICS" in load_staging.upper()
+    assert "GOLD_TICKET_TOPICS" in load_staging.upper()
+    assert "BRONZE_EXTERNAL_EVENTS" in load_staging.upper()
+    assert "SILVER_EXTERNAL_EVENTS" in load_staging.upper()
+
+
+def test_migrations_keep_one_load_staging_signature_and_never_drop():
+    from signal_service.demo.snowflake_deploy import load_statements
+
+    statements = load_statements() + medallion_statements()
+    load_signatures = []
+    rerun_signatures = []
+    for statement in statements:
+        assert re.search(r"(?i)\bdrop\b", statement) is None
+        load = re.search(
+            r"(?is)create\s+(?:or\s+replace\s+)?procedure\s+[\w.]+\.LOAD_STAGING\s*\((.*?)\)",
+            statement,
+        )
+        if load:
+            load_signatures.append(" ".join(load.group(1).split()))
+            assert not re.search(r"(?i)\bdefault\b", statement.split("$$", 1)[0])
+        rerun = re.search(
+            r"(?is)create\s+(?:or\s+replace\s+)?procedure\s+[\w.]+\.RERUN_STAGING\s*\((.*?)\)",
+            statement,
+        )
+        if rerun:
+            rerun_signatures.append(" ".join(rerun.group(1).split()))
+    assert load_signatures == ["batch VARCHAR"]
+    assert rerun_signatures == ["batch VARCHAR"]
+
+
+def test_procedure_compile_failure_does_not_skip_ahead_to_tasks():
+    class Scripted:
+        backend = "snowflake"
+
+        def __init__(self):
+            self.statements: list[str] = []
+
+        def execute(self, sql, params=None):
+            self.statements.append(sql)
+            folded = " ".join(sql.lower().split())
+            if folded.startswith("create") and " procedure " in folded[:180] and "load_staging" in folded:
+                raise RuntimeError(
+                    "Cannot overload PROCEDURE LOAD_STAGING as it would cause ambiguous PROCEDURE overloading."
+                )
+
+    warehouse = Scripted()
+    with pytest.raises(ProcedureCompileError, match="tasks were not created"):
+        install_event_driven(warehouse)
+    assert not any(" task " in " ".join(statement.lower().split())[:80] for statement in warehouse.statements)
 
 
 def test_compilation_error_is_not_a_missing_privilege():

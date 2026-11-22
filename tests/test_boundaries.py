@@ -149,8 +149,12 @@ def test_new_statement_types_are_sandbox_scoped():
     )
     assert_sandbox_write(f"ALTER TASK {sandbox}.TASK_BRONZE_TO_SILVER RESUME")
     assert_sandbox_write(f"CALL {sandbox}.LOAD_STAGING('seed-20261108-20261120')")
+    assert_sandbox_write(f"CALL {sandbox}.RERUN_STAGING('seed-20261108-20261120')")
     assert_sandbox_write(
         f"CREATE OR REPLACE PROCEDURE {sandbox}.LOAD_STAGING(batch VARCHAR) RETURNS VARCHAR LANGUAGE SQL AS $$ BEGIN RETURN batch; END; $$"
+    )
+    assert_sandbox_write(
+        f"CREATE OR REPLACE PROCEDURE {sandbox}.RERUN_STAGING(batch VARCHAR) RETURNS VARCHAR LANGUAGE SQL AS $$ BEGIN CALL {sandbox}.LOAD_STAGING(batch); END; $$"
     )
     assert_sandbox_write(dynamic_table_sql("COMPUTE_WH"))
     qualified = prepare_sql(
@@ -168,6 +172,11 @@ def test_new_statement_types_are_sandbox_scoped():
         assert_sandbox_write("CALL OTHER_DB.SIGNAL_SANDBOX.LOAD_STAGING('x')")
     with pytest.raises(UnsafeSQL):
         assert_sandbox_write(f"CREATE OR REPLACE PROCEDURE {sandbox}.OTHER_PROC() RETURNS VARCHAR LANGUAGE SQL AS $$ BEGIN RETURN 'x'; END; $$")
+    with pytest.raises(UnsafeSQL):
+        assert_sandbox_write(
+            f"CREATE OR REPLACE PROCEDURE {sandbox}.LOAD_STAGING(batch VARCHAR, rerun BOOLEAN DEFAULT FALSE) "
+            "RETURNS VARCHAR LANGUAGE SQL AS $$ BEGIN RETURN batch; END; $$"
+        )
     with pytest.raises(UnsafeSQL):
         assert_sandbox_write("CREATE OR REPLACE STREAM PUBLIC.STREAM_BRONZE_GROUPS ON TABLE PUBLIC.BRONZE_GROUPS")
     with pytest.raises(ValueError):

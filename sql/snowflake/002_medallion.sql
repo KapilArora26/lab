@@ -4,7 +4,10 @@
 -- ALTER TASK ... RESUME is the only ALTER in this file. Tasks are created
 -- suspended, and RESUME is what lets them see streams. There is no DROP,
 -- TRUNCATE, GRANT, or ALTER TABLE. Each task body is one statement:
--- CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(NULL). A compilation error is not a
+-- CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(NULL). LOAD_STAGING keeps the
+-- single argument (batch VARCHAR). A second argument would overload the
+-- procedure already in the sandbox instead of replacing it. Reprocess a
+-- batch with RERUN_STAGING(batch VARCHAR). A compilation error is not a
 -- missing privilege. If the role lacks CREATE PROCEDURE, ingest fails closed
 -- instead of reading bronze into the client.
 --
@@ -494,7 +497,7 @@ CREATE OR REPLACE STREAM MCP_DB.SIGNAL_SANDBOX.STREAM_SILVER_GROUPS
 
 -- @section procedure
 
-CREATE OR REPLACE PROCEDURE MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(batch VARCHAR, rerun BOOLEAN DEFAULT FALSE)
+CREATE OR REPLACE PROCEDURE MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(batch VARCHAR)
 RETURNS VARCHAR
 LANGUAGE SQL
 EXECUTE AS CALLER
@@ -502,7 +505,6 @@ AS
 $$
 DECLARE
     v_batch VARCHAR;
-    v_rerun BOOLEAN;
     v_loaded TIMESTAMP_NTZ;
     v_start TIMESTAMP_NTZ;
     v_run VARCHAR;
@@ -514,8 +516,7 @@ DECLARE
     v_gold_out NUMBER;
 BEGIN
     v_batch := batch;
-    v_rerun := COALESCE(rerun, FALSE);
-    v_loaded := CURRENT_TIMESTAMP();
+    v_loaded := CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ;
     v_start := v_loaded;
     v_run := UUID_STRING();
 
@@ -589,7 +590,7 @@ BEGIN
     WHERE (:v_batch IS NULL OR _batch_id = :v_batch)
     GROUP BY topic, sentiment, severity, product_area, _batch_id;
 
-    IF (v_rerun = FALSE AND v_batch IS NOT NULL AND EXISTS (
+    IF (v_batch IS NOT NULL AND EXISTS (
         SELECT 1
         FROM MCP_DB.SIGNAL_SANDBOX.PIPELINE_RUNS
         WHERE batch_id = :v_batch AND layer = 'gold' AND status = 'success'
@@ -617,10 +618,10 @@ BEGIN
             CASE
                 WHEN group_id IS NULL THEN 'null group_id'
                 WHEN hour IS NULL THEN 'null hour'
-                WHEN n_sessions IS NULL OR n_sessions < 0 THEN 'negative n_sessions'
-                WHEN n_convert IS NULL OR n_convert < 0 THEN 'negative n_convert'
-                WHEN n_attempt IS NULL OR n_convert > n_attempt THEN 'n_convert exceeds n_attempt'
-                WHEN n_convert > n_sessions THEN 'n_convert exceeds n_sessions'
+                WHEN n_sessions IS NULL OR n_convert IS NULL OR n_attempt IS NULL THEN 'null metric'
+                WHEN n_sessions < 0 OR n_convert < 0 OR n_attempt < 0 THEN 'negative_count'
+                WHEN n_convert > n_sessions THEN 'conversions_gt_sessions'
+                WHEN n_convert > n_attempt THEN 'conversions_gt_attempts'
                 WHEN platform IS NULL OR country IS NULL THEN 'null segment'
                 WHEN rn > 1 THEN 'duplicate group_id'
                 ELSE NULL
@@ -652,6 +653,7 @@ BEGIN
               AND country IS NOT NULL
               AND n_sessions >= 0
               AND n_convert >= 0
+              AND n_attempt >= 0
               AND n_attempt >= n_convert
               AND n_sessions >= n_convert
         )
@@ -838,7 +840,7 @@ BEGIN
         COALESCE(:v_batch, 'pending'),
         'silver',
         :v_start,
-        CURRENT_TIMESTAMP(),
+        CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ,
         :v_status,
         :v_in,
         :v_out,
@@ -954,7 +956,7 @@ BEGIN
         COALESCE(:v_batch, 'pending'),
         'gold',
         :v_start,
-        CURRENT_TIMESTAMP(),
+        CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ,
         :v_status,
         :v_gold_out,
         :v_gold_out,
@@ -965,6 +967,30 @@ BEGIN
     IF (v_status <> 'success') THEN
         RETURN v_error;
     END IF;
+    RETURN 'ok';
+END;
+$$;
+
+-- Reprocess one batch after a gold row was marked success. This is a separate
+-- procedure so LOAD_STAGING stays LOAD_STAGING(VARCHAR) and replaces the
+-- existing procedure instead of overloading it. The DELETE touches only the
+-- success marker in PIPELINE_RUNS. It does not drop or truncate data tables.
+CREATE OR REPLACE PROCEDURE MCP_DB.SIGNAL_SANDBOX.RERUN_STAGING(batch VARCHAR)
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+    v_batch VARCHAR;
+BEGIN
+    v_batch := batch;
+    IF (v_batch IS NULL) THEN
+        RETURN 'batch is required';
+    END IF;
+    DELETE FROM MCP_DB.SIGNAL_SANDBOX.PIPELINE_RUNS
+    WHERE batch_id = :v_batch AND layer = 'gold' AND status = 'success';
+    CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(:v_batch);
     RETURN 'ok';
 END;
 $$;

@@ -338,8 +338,7 @@ def _assert_created_object_qualified(text: str, sandbox: str) -> None:
     if not name.upper().startswith(sandbox.upper() + "."):
         raise UnsafeSQL(f"{name} must be created inside {sandbox}")
     if re.match(r"(?is)^create\s+(?:or\s+replace\s+)?procedure\b", text):
-        if f"{sandbox.upper()}.LOAD_STAGING" not in " ".join(text.upper().split()):
-            raise UnsafeSQL(f"only procedure {sandbox}.LOAD_STAGING may be created")
+        _assert_allowed_procedure(text, sandbox)
 
 
 def _assert_alter_or_call(text: str, sandbox: str) -> None:
@@ -349,9 +348,32 @@ def _assert_alter_or_call(text: str, sandbox: str) -> None:
         if not re.match(pattern, collapsed):
             raise UnsafeSQL(f"only ALTER TASK {sandbox}.<task> RESUME is allowed")
     if re.match(r"(?is)^call\b", collapsed):
-        pattern = rf"(?is)^call\s+{re.escape(sandbox)}\.LOAD_STAGING\s*\("
+        pattern = rf"(?is)^call\s+{re.escape(sandbox)}\.(?:LOAD_STAGING|RERUN_STAGING)\s*\("
         if not re.match(pattern, collapsed):
-            raise UnsafeSQL(f"only CALL {sandbox}.LOAD_STAGING is allowed")
+            raise UnsafeSQL(f"only CALL {sandbox}.LOAD_STAGING or {sandbox}.RERUN_STAGING is allowed")
+
+
+def _assert_allowed_procedure(text: str, sandbox: str) -> None:
+    """LOAD_STAGING stays one VARCHAR argument so CREATE OR REPLACE replaces it.
+
+    A second argument, or DEFAULT, creates an overload. Snowflake then refuses
+    the statement because the new signature is ambiguous with LOAD_STAGING(VARCHAR).
+    """
+    match = re.match(
+        r"(?is)^create\s+(?:or\s+replace\s+)?procedure\s+"
+        rf"{re.escape(sandbox)}\.(LOAD_STAGING|RERUN_STAGING)\s*\((.*?)\)",
+        text,
+    )
+    if match is None:
+        raise UnsafeSQL(f"only procedures {sandbox}.LOAD_STAGING and {sandbox}.RERUN_STAGING may be created")
+    args = " ".join(match.group(2).split())
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\s+VARCHAR", args, re.IGNORECASE):
+        raise UnsafeSQL(
+            f"{match.group(1)} must take exactly one VARCHAR argument so it replaces the existing procedure"
+        )
+    head = text.split("$$", 1)[0]
+    if re.search(r"(?i)\bdefault\b", head):
+        raise UnsafeSQL(f"{match.group(1)} must not declare DEFAULT parameters")
 
 
 def _parse_timestamp(value: Any) -> datetime:

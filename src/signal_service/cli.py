@@ -146,11 +146,16 @@ def _ingest(args) -> int:
 
     kind, path = _parse_batch(args.batch)
     warehouse = _open_warehouse(args)
+    from signal_service.pipeline.mode import ProcedureCompileError
+
     try:
         report = ingest(warehouse, batch=kind, path=path, hours=args.hours, rerun=args.rerun)
     except SnowflakeIPBlocked as exc:
         _report_ip_block(exc)
         return 2
+    except ProcedureCompileError as exc:
+        print(str(exc))
+        return 1
     finally:
         warehouse.close()
     print(json.dumps(report, indent=2, default=_json_default))
@@ -161,11 +166,16 @@ def _rerun(args) -> int:
     from signal_service.pipeline.ingest import rerun_batch
 
     warehouse = _open_warehouse(args)
+    from signal_service.pipeline.mode import ProcedureCompileError
+
     try:
         report = rerun_batch(warehouse, args.batch_id)
     except SnowflakeIPBlocked as exc:
         _report_ip_block(exc)
         return 2
+    except ProcedureCompileError as exc:
+        print(str(exc))
+        return 1
     finally:
         warehouse.close()
     print(json.dumps(report, indent=2, default=_json_default))
@@ -188,11 +198,16 @@ def _deploy_snowflake() -> int:
         print("SNOWFLAKE_PAT_TOKEN is not set")
         _print_public_ip()
         return 2
+    from signal_service.pipeline.mode import ProcedureCompileError
+
     try:
         report = deploy_sandbox(warehouse)
     except SnowflakeIPBlocked as exc:
         _report_ip_block(exc)
         return 2
+    except ProcedureCompileError as exc:
+        print(str(exc))
+        return 1
     finally:
         warehouse.close()
     report["token_source"] = token_source()
