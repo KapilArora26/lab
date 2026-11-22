@@ -7,6 +7,7 @@ duplicate bronze rows. Sessions, payments, and orders stay views over silver.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 
 from signal_service.demo.generate import ANOMALY_START, golden_rows, group_rows
@@ -49,6 +50,12 @@ def _count(warehouse: SnowflakeWarehouse, sql: str) -> dict:
     return {key: int(value) if value is not None and float(value) == int(float(value)) else value for key, value in rows[0].items()}
 
 
+def _batch_literal(batch_id: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", batch_id or ""):
+        raise RuntimeError("seed batch id is not a safe SQL literal")
+    return batch_id
+
+
 def _require(actual: dict, expected: dict, label: str) -> None:
     for key, value in expected.items():
         got = actual.get(key)
@@ -83,24 +90,27 @@ def deploy_sandbox(warehouse: SnowflakeWarehouse, client=None) -> dict:
     assert_reconciled(warehouse, ingested["batch_id"], expect_external=2)
 
     groups = group_rows()
+    seed = _batch_literal(ingested["batch_id"])
 
     expected = expansion_totals(groups)
     print("checking session, payment, and order views", flush=True)
     sessions = _count(
         warehouse,
-        """
+        f"""
         SELECT count(*)::INTEGER AS sessions,
                sum(CASE WHEN converted THEN 1 ELSE 0 END)::INTEGER AS converted
-        FROM sessions
+        FROM silver_sessions
+        WHERE _batch_id = '{seed}'
         """,
     )
     _require(sessions, {"sessions": expected["sessions"], "converted": expected["converted"]}, "sessions view")
     payments = _count(
         warehouse,
-        """
+        f"""
         SELECT count(*)::INTEGER AS payments,
                sum(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END)::INTEGER AS payment_succeeded
-        FROM payments
+        FROM silver_payments
+        WHERE _batch_id = '{seed}'
         """,
     )
     _require(
@@ -110,7 +120,11 @@ def deploy_sandbox(warehouse: SnowflakeWarehouse, client=None) -> dict:
     )
     orders = _count(
         warehouse,
-        "SELECT count(*)::INTEGER AS orders, avg(amount_usd)::DOUBLE AS aov FROM orders",
+        f"""
+        SELECT count(*)::INTEGER AS orders, avg(amount_usd)::DOUBLE AS aov
+        FROM silver_orders
+        WHERE _batch_id = '{seed}'
+        """,
     )
     if int(orders["orders"]) != expected["orders"]:
         raise RuntimeError(f"orders view count is {orders['orders']}, expected {expected['orders']}")
@@ -125,16 +139,20 @@ def deploy_sandbox(warehouse: SnowflakeWarehouse, client=None) -> dict:
             slice_converted += int(row[9])
     incident = _count(
         warehouse,
-        """
+        f"""
         SELECT count(*)::INTEGER AS volume,
                sum(CASE WHEN converted THEN 1 ELSE 0 END)::INTEGER AS positives
-        FROM sessions
+        FROM silver_sessions
         WHERE platform = 'android' AND country = 'IN'
           AND ts = '2026-11-20 02:00:00'::TIMESTAMP_NTZ
+          AND _batch_id = '{seed}'
         """,
     )
     _require(incident, {"volume": slice_volume, "positives": slice_converted}, "android India hour")
-    tickets = _count(warehouse, "SELECT count(*)::INTEGER AS tickets FROM bronze_support_tickets")
+    tickets = _count(
+        warehouse,
+        f"SELECT count(*)::INTEGER AS tickets FROM bronze_support_tickets WHERE _batch_id = '{seed}'",
+    )
     if int(tickets["tickets"]) != 92:
         raise RuntimeError(f"support tickets are {tickets['tickets']}, expected 92")
 
@@ -147,7 +165,16 @@ def deploy_sandbox(warehouse: SnowflakeWarehouse, client=None) -> dict:
 
     print("classifying the seeded incident so ticket topics can be checked", flush=True)
     demo = run_pipeline(warehouse, client, simulate_build_approval=True)
-    topics = _count(warehouse, "SELECT count(*)::INTEGER AS topics FROM signals.ticket_topics")
+    topics = _count(
+        warehouse,
+        f"""
+        SELECT count(*)::INTEGER AS topics
+        FROM signals.ticket_topics
+        WHERE ticket_id IN (
+            SELECT ticket_id FROM bronze_support_tickets WHERE _batch_id = '{seed}'
+        )
+        """,
+    )
     if int(topics["topics"]) != 73:
         raise RuntimeError(f"ticket topics are {topics['topics']}, expected 73")
     assert_reconciled(warehouse, ingested["batch_id"], expect_topics=73, expect_external=2)

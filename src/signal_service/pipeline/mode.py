@@ -153,6 +153,9 @@ def dynamic_table_sql(warehouse_name: str, *, sandbox: str = SANDBOX_QUALIFIED) 
           AND n_attempt >= 0
           AND n_attempt >= n_convert
           AND n_sessions >= n_convert
+          AND YEAR(hour) <> 1970
+          AND hour >= TO_TIMESTAMP_NTZ('2020-01-01')
+          AND hour <= DATEADD('second', 86400, CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ)
     """.strip()
 
 

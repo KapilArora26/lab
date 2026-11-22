@@ -627,7 +627,7 @@ def test_null_batch_consumes_streams_and_never_writes_pending():
         assert stream in consumed
     assert "METADATA$ACTION" in consumed
     assert "LAYER = 'GOLD'" in consumed
-    assert "STATUS = 'SUCCESS'" in consumed
+    assert "STATUS IN ('SUCCESS', 'FAILED')" in consumed
     assert "DELETE FROM MCP_DB.SIGNAL_SANDBOX.GOLD_DAILY_SPEND" in upper
     assert "WHERE _BATCH_ID IN (SELECT BATCH_ID FROM MCP_DB.SIGNAL_SANDBOX.STREAM_BATCH_QUEUE)" in upper
     assert "V_BATCH IS NULL OR" not in upper

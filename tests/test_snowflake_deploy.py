@@ -153,7 +153,12 @@ class _Remote:
         self.columns: set[tuple[str, str]] = set()
         self.added: list[tuple[str, str]] = []
         self.writes: list[str] = []
+        self.reads: list[str] = []
         self.gold_done = False
+
+
+def _seed_scoped(upper: str) -> bool:
+    return "SEED-2026-11-08" in upper and "_BATCH_ID" in upper
 
 
 def _answer_read(remote: _Remote, sql: str) -> tuple[list[str], list[list]]:
@@ -172,16 +177,28 @@ def _answer_read(remote: _Remote, sql: str) -> tuple[list[str], list[list]]:
         ]
         return ["LAYER", "STATUS", "ROWS_IN", "ROWS_OUT", "ROWS_REJECTED", "ERROR", "STARTED_AT"], rows
     if " AS VOLUME" in upper:
+        if not _seed_scoped(upper):
+            return ["VOLUME", "POSITIVES"], [[_SLICE_VOLUME + 500, _SLICE_CONVERTED + 20]]
         return ["VOLUME", "POSITIVES"], [[_SLICE_VOLUME, _SLICE_CONVERTED]]
     if " AS SESSIONS" in upper:
+        if not _seed_scoped(upper):
+            return ["SESSIONS", "CONVERTED"], [[432700, _EXPECTED["converted"] + 1500]]
         return ["SESSIONS", "CONVERTED"], [[_EXPECTED["sessions"], _EXPECTED["converted"]]]
     if " AS PAYMENTS" in upper:
+        if not _seed_scoped(upper):
+            return ["PAYMENTS", "PAYMENT_SUCCEEDED"], [[_EXPECTED["payments"] + 800, _EXPECTED["payment_succeeded"]]]
         return ["PAYMENTS", "PAYMENT_SUCCEEDED"], [[_EXPECTED["payments"], _EXPECTED["payment_succeeded"]]]
     if " AS ORDERS" in upper:
+        if not _seed_scoped(upper):
+            return ["ORDERS", "AOV"], [[_EXPECTED["orders"] + 400, 48.0]]
         return ["ORDERS", "AOV"], [[_EXPECTED["orders"], 48.0]]
     if " AS TICKETS" in upper:
+        if not _seed_scoped(upper):
+            return ["TICKETS"], [[120]]
         return ["TICKETS"], [[92]]
     if " AS TOPICS" in upper:
+        if not _seed_scoped(upper):
+            return ["TOPICS"], [[90]]
         return ["TOPICS"], [[73]]
     if "SILVER_REJECTS" in upper:
         return ["N"], [[0]]
@@ -205,6 +222,7 @@ def _deploy_handler(remote: _Remote):
         if " DROP " in f" {upper} " or " TRUNCATE " in f" {upper} ":
             raise AssertionError(upper[:200])
         if tool == "sql_read_tool":
+            remote.reads.append(upper)
             columns, data = _answer_read(remote, sql)
             return _ok(body, columns, data)
         remote.writes.append(upper)
@@ -278,3 +296,6 @@ def test_second_deploy_is_a_noop_and_exits_zero(monkeypatch, capsys):
     assert "fallback-token" not in first_out and "fallback-token" not in second_out
     assert remote.added == added_after_first
     assert not any(" DROP " in f" {sql} " or " TRUNCATE " in f" {sql} " for sql in remote.writes)
+    scoped = [sql for sql in remote.reads if " AS SESSIONS" in sql or " AS PAYMENTS" in sql or " AS ORDERS" in sql]
+    assert scoped
+    assert all(_seed_scoped(sql) for sql in scoped)

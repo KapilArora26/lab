@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import datetime
 
 
 DEFAULT_SNOWFLAKE_MCP_URL = (
@@ -48,6 +49,8 @@ class Settings:
     snowflake_sandbox: str = SANDBOX_QUALIFIED
     pipeline_mode: str = "auto"
     ingest_hours: int = 6
+    dq_timestamp_floor: datetime = datetime(2020, 1, 1)
+    dq_future_grace_seconds: int = 86400
 
 
 def load_settings() -> Settings:
@@ -68,4 +71,12 @@ def load_settings() -> Settings:
         snowflake_sandbox=os.environ.get("SNOWFLAKE_SANDBOX", SANDBOX_QUALIFIED),
         pipeline_mode=os.environ.get("SIGNAL_PIPELINE_MODE", "auto"),
         ingest_hours=_int("SIGNAL_INGEST_HOURS", 6),
+        dq_timestamp_floor=_day("SIGNAL_DQ_TIMESTAMP_FLOOR", "2020-01-01"),
+        dq_future_grace_seconds=_int("SIGNAL_DQ_FUTURE_GRACE_SECONDS", 86400),
     )
+
+
+def _day(name: str, default: str) -> datetime:
+    raw = os.environ.get(name)
+    text = default if raw is None or raw == "" else raw.strip()
+    return datetime.fromisoformat(text[:10])

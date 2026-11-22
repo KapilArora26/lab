@@ -6,6 +6,7 @@ import json
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from signal_service.hashing import bronze_row_key, timestamp_reason
 from signal_service.safety.redaction import pii_kinds
 
 
@@ -137,6 +138,9 @@ def group_reason(row: dict, seen: set[str]) -> str | None:
         return "conversions_gt_attempts"
     if not row.get("platform") or not row.get("country"):
         return "null segment"
+    stamped = timestamp_reason(row.get("hour"))
+    if stamped:
+        return stamped
     return None
 
 
@@ -233,21 +237,27 @@ def _removed_keys(warehouse, batch_id: str, source: str) -> set[str]:
     return {str(row["row_key"]) for row in rows}
 
 
-def _annotate(rows, reason_fn, loaded_at, batch_id, key: str, removed: set[str]):
-    """Keep every non-PII row. Suspect rows carry the validation reason."""
+def _annotate(rows, reason_fn, loaded_at, batch_id, source: str, removed: set[str]):
+    """Keep every non-PII row that has not been removed.
+
+    The identity is a hash of the batch and the full business row, so a null
+    group_id still matches its archive. Comparison is on that string, which
+    is never null.
+    """
     kept: list[dict] = []
     rejected: list[tuple[dict, str]] = []
     skipped = 0
     for row in rows:
+        identity = bronze_row_key(source, batch_id, row)
+        if identity in removed:
+            skipped += 1
+            continue
         reason = reason_fn(row)
         if _is_pii(reason):
             rejected.append((row, reason))
             continue
-        identity = row.get(key)
-        if reason and identity is not None and str(identity) in removed:
-            skipped += 1
-            continue
         landed = _with_load(row, loaded_at, batch_id, drop=("_ingested_at", "_source"))
+        landed["row_key"] = identity
         landed["dq_status"] = "suspect" if reason else "ok"
         landed["dq_reason"] = reason
         kept.append(landed)
@@ -285,7 +295,7 @@ def _insert_rejects(warehouse, batch_id: str, loaded_at: datetime, source: str, 
                 reason,
                 loaded_at,
                 batch_id,
-                None,
+                bronze_row_key(source, batch_id, row),
                 None,
                 None,
             )
@@ -315,7 +325,7 @@ def load_silver(warehouse, batch_id: str, loaded_at: datetime) -> dict:
     rows_out = 0
     rows_rejected = 0
 
-    def take(source, table, key, columns, query, reason_fn):
+    def take(source, table, columns, query, reason_fn):
         nonlocal rows_in, rows_out, rows_rejected
         incoming = warehouse.query(query, [batch_id])
         rows_in += len(incoming)
@@ -324,7 +334,7 @@ def load_silver(warehouse, batch_id: str, loaded_at: datetime) -> dict:
             reason_fn,
             loaded_at,
             batch_id,
-            key,
+            source,
             _removed_keys(warehouse, batch_id, source),
         )
         rows_out += _replace_batch(warehouse, table, columns, kept, batch_id)
@@ -335,7 +345,6 @@ def load_silver(warehouse, batch_id: str, loaded_at: datetime) -> dict:
     take(
         "bronze_groups",
         "silver_groups",
-        "group_id",
         [
             "group_id",
             "hour",
@@ -350,6 +359,7 @@ def load_silver(warehouse, batch_id: str, loaded_at: datetime) -> dict:
             "n_attempt",
             "_loaded_at",
             "_batch_id",
+            "row_key",
             "dq_status",
             "dq_reason",
         ],
@@ -360,7 +370,6 @@ def load_silver(warehouse, batch_id: str, loaded_at: datetime) -> dict:
     take(
         "bronze_support_tickets",
         "silver_support_tickets",
-        "ticket_id",
         [
             "ticket_id",
             "ts",
@@ -374,6 +383,7 @@ def load_silver(warehouse, batch_id: str, loaded_at: datetime) -> dict:
             "text_redacted",
             "_loaded_at",
             "_batch_id",
+            "row_key",
             "dq_status",
             "dq_reason",
         ],
@@ -384,8 +394,7 @@ def load_silver(warehouse, batch_id: str, loaded_at: datetime) -> dict:
     take(
         "bronze_deploys",
         "silver_deploys",
-        "deploy_id",
-        ["deploy_id", "deployed_at", "platform", "app_version", "note", "_loaded_at", "_batch_id", "dq_status", "dq_reason"],
+        ["deploy_id", "deployed_at", "platform", "app_version", "note", "_loaded_at", "_batch_id", "row_key", "dq_status", "dq_reason"],
         "SELECT * FROM bronze_deploys WHERE _batch_id = ? ORDER BY deploy_id",
         lambda row: _simple_reason(row, "deploy_id", seen, "deploy_id"),
     )
@@ -393,8 +402,7 @@ def load_silver(warehouse, batch_id: str, loaded_at: datetime) -> dict:
     take(
         "bronze_demo_meta",
         "silver_demo_meta",
-        "key",
-        ["key", "value", "_loaded_at", "_batch_id", "dq_status", "dq_reason"],
+        ["key", "value", "_loaded_at", "_batch_id", "row_key", "dq_status", "dq_reason"],
         "SELECT * FROM bronze_demo_meta WHERE _batch_id = ? ORDER BY key",
         lambda row: _simple_reason(row, "key", seen, "meta key"),
     )
@@ -412,7 +420,6 @@ def load_silver(warehouse, batch_id: str, loaded_at: datetime) -> dict:
     take(
         "bronze_golden_tickets",
         "silver_golden_tickets",
-        "example_id",
         [
             "example_id",
             "text_redacted",
@@ -422,6 +429,7 @@ def load_silver(warehouse, batch_id: str, loaded_at: datetime) -> dict:
             "product_area",
             "_loaded_at",
             "_batch_id",
+            "row_key",
             "dq_status",
             "dq_reason",
         ],
@@ -432,7 +440,6 @@ def load_silver(warehouse, batch_id: str, loaded_at: datetime) -> dict:
     take(
         "bronze_external_events",
         "silver_external_events",
-        "event_id",
         [
             "event_id",
             "case_id",
@@ -446,6 +453,7 @@ def load_silver(warehouse, batch_id: str, loaded_at: datetime) -> dict:
             "provider",
             "_loaded_at",
             "_batch_id",
+            "row_key",
             "dq_status",
             "dq_reason",
         ],
@@ -677,6 +685,8 @@ def _spend_rows(warehouse, batch_id: str, loaded_at: datetime, grains: list[dict
             spend_date = datetime.fromisoformat(str(latest)).date()
     if spend_date is None:
         spend_date = loaded_at.date()
+    if timestamp_reason(spend_date) and int(suspect_rows) == 0:
+        suspect_rows = 1
     return [
         {
             "spend_date": spend_date,
@@ -816,20 +826,29 @@ def mirror_signals(warehouse, batch_id: str, loaded_at: datetime | None = None) 
         spend = warehouse.query("SELECT * FROM signals.spend_log")
     except Exception:
         spend = []
-    spend_rows = [
-        {
-            "logged_at": row.get("logged_at"),
-            "case_id": row.get("case_id"),
-            "kind": row.get("kind"),
-            "estimated_usd": row.get("estimated_usd"),
-            "input_tokens": row.get("input_tokens"),
-            "output_tokens": row.get("output_tokens"),
-            "provider": row.get("provider"),
-            "_loaded_at": loaded_at,
-            "_batch_id": batch_id,
-        }
-        for row in spend
-    ]
+    removed_spend = _removed_keys(warehouse, batch_id, "silver_spend")
+    spend_rows = []
+    for row in spend:
+        identity = bronze_row_key("silver_spend", batch_id, row)
+        if identity in removed_spend:
+            continue
+        reason = timestamp_reason(row.get("logged_at"))
+        spend_rows.append(
+            {
+                "logged_at": row.get("logged_at"),
+                "case_id": row.get("case_id"),
+                "kind": row.get("kind"),
+                "estimated_usd": row.get("estimated_usd"),
+                "input_tokens": row.get("input_tokens"),
+                "output_tokens": row.get("output_tokens"),
+                "provider": row.get("provider"),
+                "_loaded_at": loaded_at,
+                "_batch_id": batch_id,
+                "row_key": identity,
+                "dq_status": "suspect" if reason else "ok",
+                "dq_reason": reason,
+            }
+        )
     if spend_rows:
         _merge(
             warehouse,
