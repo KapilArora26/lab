@@ -28,8 +28,11 @@ def test_write_guard_allows_only_the_sandbox():
     assert_sandbox_write("INSERT INTO MCP_DB.SIGNAL_SANDBOX.TICKET_TOPICS (ticket_id) VALUES ('t1')")
     with pytest.raises(UnsafeSQL):
         assert_sandbox_write("DROP TABLE MCP_DB.PUBLIC.X")
+    assert_sandbox_write(
+        "ALTER TABLE MCP_DB.SIGNAL_SANDBOX.TICKET_TOPICS ADD COLUMN IF NOT EXISTS dq_status VARCHAR DEFAULT 'ok'"
+    )
     with pytest.raises(UnsafeSQL):
-        assert_sandbox_write("ALTER TABLE MCP_DB.SIGNAL_SANDBOX.TICKET_TOPICS ADD COLUMN extra VARCHAR")
+        assert_sandbox_write("ALTER TABLE MCP_DB.SIGNAL_SANDBOX.TICKET_TOPICS DROP COLUMN dq_status")
     with pytest.raises(UnsafeSQL):
         assert_sandbox_write("CREATE TABLE MCP_DB.PUBLIC.TICKET_TOPICS (id VARCHAR)")
     with pytest.raises(UnsafeSQL):

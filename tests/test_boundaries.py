@@ -164,8 +164,12 @@ def test_new_statement_types_are_sandbox_scoped():
     )
     assert f"{sandbox}.silver_groups" in qualified
     assert_sandbox_write(qualified)
+    assert_sandbox_write(
+        f"ALTER TABLE {sandbox}.SILVER_GROUPS ADD COLUMN IF NOT EXISTS dq_status VARCHAR DEFAULT 'ok'"
+    )
+    assert_sandbox_write(f"CALL {sandbox}.REMOVE_SUSPECT('batch-1', 'removed on request')")
     with pytest.raises(UnsafeSQL):
-        assert_sandbox_write(f"ALTER TABLE {sandbox}.SILVER_GROUPS ADD COLUMN extra VARCHAR")
+        assert_sandbox_write(f"ALTER TABLE {sandbox}.SILVER_GROUPS DROP COLUMN dq_status")
     with pytest.raises(UnsafeSQL):
         assert_sandbox_write(f"ALTER TASK {sandbox}.TASK_BRONZE_TO_SILVER SUSPEND")
     with pytest.raises(UnsafeSQL):

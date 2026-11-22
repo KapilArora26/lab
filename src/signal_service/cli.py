@@ -78,6 +78,15 @@ def main(argv: list[str] | None = None) -> int:
     rerun.add_argument("--db", default="data/warehouse/demo.duckdb")
     rerun.add_argument("--backend", choices=("duckdb", "snowflake"), default="duckdb")
 
+    remove = sub.add_parser(
+        "remove-suspect",
+        help="Archive one batch's suspect rows and recompute gold. Does not DROP or TRUNCATE.",
+    )
+    remove.add_argument("batch_id")
+    remove.add_argument("--reason", default=None)
+    remove.add_argument("--db", default="data/warehouse/demo.duckdb")
+    remove.add_argument("--backend", choices=("duckdb", "snowflake"), default="duckdb")
+
     args = parser.parse_args(argv)
     settings = load_settings()
 
@@ -116,6 +125,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "rerun":
         return _rerun(args)
+
+    if args.command == "remove-suspect":
+        return _remove_suspect(args)
 
     if args.command == "serve":
         import uvicorn
@@ -180,6 +192,28 @@ def _rerun(args) -> int:
         warehouse.close()
     print(json.dumps(report, indent=2, default=_json_default))
     return 0 if report.get("status") in {"success", "noop", "landed"} else 1
+
+
+def _remove_suspect(args) -> int:
+    from signal_service.pipeline.quality import remove_suspect
+
+    warehouse = _open_warehouse(args)
+    try:
+        if args.backend == "snowflake":
+            warehouse.execute(
+                "CALL MCP_DB.SIGNAL_SANDBOX.REMOVE_SUSPECT(?, ?)",
+                [args.batch_id, args.reason or "removed on request"],
+            )
+            report = {"batch_id": args.batch_id, "status": "success", "reason": args.reason or "removed on request"}
+        else:
+            report = remove_suspect(warehouse, args.batch_id, args.reason)
+    except SnowflakeIPBlocked as exc:
+        _report_ip_block(exc)
+        return 2
+    finally:
+        warehouse.close()
+    print(json.dumps(report, indent=2, default=_json_default))
+    return 0 if report.get("status") == "success" else 1
 
 
 def _parse_batch(values: list[str]) -> tuple[str, str | None]:

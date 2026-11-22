@@ -158,13 +158,16 @@ def test_data_quality_and_pii_stay_out_of_silver_and_gold(demo_wh, tmp_path):
     path.write_text(json.dumps(payload), encoding="utf-8")
     result = ingest(demo_wh, batch="file", path=str(path))
     assert result["status"] == "success"
-    assert _count(demo_wh, "SELECT COUNT(*)::INTEGER AS n FROM silver_groups WHERE group_id = 'bad-1'") == 0
+    suspect = demo_wh.query("SELECT dq_status, dq_reason FROM silver_groups WHERE group_id = 'bad-1'")
+    assert suspect and suspect[0]["dq_status"] == "suspect"
+    assert suspect[0]["dq_reason"] == "conversions_gt_sessions"
     assert _count(demo_wh, "SELECT COUNT(*)::INTEGER AS n FROM silver_support_tickets WHERE ticket_id = 't-pii'") == 0
+    assert _count(demo_wh, "SELECT COUNT(*)::INTEGER AS n FROM gold_external_events WHERE event_id = 't-pii'") == 0
     reasons = {
         row["reason"]
         for row in demo_wh.query("SELECT reason FROM silver_rejects WHERE _batch_id = 'dq-batch'")
     }
-    assert "conversions_gt_sessions" in reasons
+    assert "conversions_gt_sessions" not in reasons
     assert any(reason.startswith("pii:") for reason in reasons)
     email = "jane.doe@example.com"
     bronze = demo_wh.query("SELECT text_redacted FROM bronze_support_tickets WHERE ticket_id = 't-pii'")
@@ -365,7 +368,7 @@ def test_lineage_timestamps_stay_utc_when_the_process_zone_is_pacific(tmp_path):
         time.tzset()
 
 
-def test_chaos_metrics_are_rejected_and_conserved(tmp_path):
+def test_chaos_metrics_are_flagged_and_conserved(tmp_path):
     warehouse = DuckDBWarehouse(tmp_path / "chaos.duckdb")
     try:
         batch = Batch(
@@ -385,15 +388,20 @@ def test_chaos_metrics_are_rejected_and_conserved(tmp_path):
         )
         result = ingest_batch(warehouse, batch)
         assert result["status"] == "success"
-        assert _count(warehouse, "SELECT COUNT(*)::INTEGER AS n FROM silver_groups WHERE _batch_id = ?", [batch.batch_id]) == 1
-        reasons = {
-            row["reason"]
+        assert _count(warehouse, "SELECT COUNT(*)::INTEGER AS n FROM silver_groups WHERE _batch_id = ?", [batch.batch_id]) == 4
+        flagged = {
+            row["dq_reason"]
             for row in warehouse.query(
-                "SELECT reason FROM silver_rejects WHERE _batch_id = ? AND source_table = 'bronze_groups'",
+                "SELECT dq_reason FROM silver_groups WHERE _batch_id = ? AND dq_status = 'suspect'",
                 [batch.batch_id],
             )
         }
-        assert reasons == {"conversions_gt_sessions", "negative_count"}
+        assert flagged == {"conversions_gt_sessions", "negative_count"}
+        assert _count(
+            warehouse,
+            "SELECT COUNT(*)::INTEGER AS n FROM silver_rejects WHERE _batch_id = ? AND source_table = 'bronze_groups'",
+            [batch.batch_id],
+        ) == 0
         assert reconciliation_errors(warehouse, batch.batch_id) == []
         silver = warehouse.query(
             "SELECT rows_in, rows_out, rows_rejected FROM pipeline_runs WHERE batch_id = ? AND layer = 'silver'",
@@ -401,7 +409,8 @@ def test_chaos_metrics_are_rejected_and_conserved(tmp_path):
         )[0]
         assert int(silver["rows_in"]) == int(silver["rows_out"]) + int(silver["rows_rejected"])
         assert int(silver["rows_in"]) == 4
-        assert int(silver["rows_rejected"]) == 3
+        assert int(silver["rows_rejected"]) == 0
+        assert int(silver["rows_out"]) == 4
     finally:
         warehouse.close()
 
@@ -416,6 +425,184 @@ def test_snowflake_lineage_sql_uses_utc_and_names_metric_rejects():
     dynamic = dynamic_table_sql("COMPUTE_WH")
     assert "CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ" in " ".join(dynamic.split())
     assert "n_attempt >= 0" in dynamic
+
+
+def test_suspect_rows_flow_to_gold_and_remove_suspect_is_idempotent(tmp_path):
+    from signal_service.cli import main
+    from signal_service.pipeline.quality import remove_suspect
+
+    warehouse = DuckDBWarehouse(tmp_path / "dq.duckdb")
+    try:
+        kept = _group("keep-ok", 100, 8, 12)
+        bad = _group("bad-over", 100, 140, 140)
+        other = (
+            "other-bad",
+            datetime(2026, 11, 22, 19, 0, 0),
+            "android",
+            "IN",
+            "app",
+            "upi",
+            "SKU-100",
+            "4.2.1",
+            80,
+            90,
+            90,
+        )
+        first = Batch("batch-a", "test", [kept, bad], [_pii_ticket()], [], [], [], [])
+        second = Batch("batch-b", "test", [other], [], [], [], [], [])
+        assert ingest_batch(warehouse, first)["status"] == "success"
+        assert ingest_batch(warehouse, second)["status"] == "success"
+        row = warehouse.query("SELECT dq_status, dq_reason FROM silver_groups WHERE group_id = 'bad-over'")[0]
+        assert row["dq_status"] == "suspect"
+        assert row["dq_reason"] == "conversions_gt_sessions"
+        assert warehouse.query("SELECT dq_status FROM silver_groups WHERE group_id = 'keep-ok'")[0]["dq_status"] == "ok"
+        assert _count(warehouse, "SELECT COUNT(*)::INTEGER AS n FROM silver_support_tickets WHERE ticket_id = 't-pii'") == 0
+        listed = warehouse.query(
+            'SELECT "table", "key", reason FROM gold_data_quality WHERE batch_id = ?',
+            ["batch-a"],
+        )
+        assert {(item["table"], item["key"], item["reason"]) for item in listed} == {
+            ("groups", "bad-over", "conversions_gt_sessions")
+        }
+        flagged = warehouse.query(
+            "SELECT COALESCE(SUM(dq_suspect_rows), 0)::INTEGER AS n FROM gold_hourly_conversion WHERE _batch_id = ?",
+            ["batch-a"],
+        )[0]["n"]
+        assert int(flagged) == 1
+        assert reconciliation_errors(warehouse, "batch-a") == []
+        health = warehouse.query("SELECT layer, suspect_rows FROM gold_health")
+        assert any(int(item["suspect_rows"]) >= 1 for item in health if item["layer"] == "gold")
+
+        from signal_service.api.app import create_app
+        from fastapi.testclient import TestClient
+
+        client = TestClient(create_app(warehouse))
+        page = client.get("/dashboard")
+        assert page.status_code == 200
+        assert "Data quality" in page.text
+        assert "conversions_gt_sessions" in page.text
+        assert "bad-over" in page.text
+        chat = client.post("/v1/dashboard/chat", json={"persona": "narrator", "message": "What looks wrong?"})
+        assert chat.status_code == 200
+        assert "suspect" in chat.json()["reply"].lower()
+        assert "conversions_gt_sessions" in chat.json()["reply"]
+
+        removed = remove_suspect(warehouse, "batch-a", "engineering request")
+        assert removed["removed"] == 1
+        assert _count(warehouse, "SELECT COUNT(*)::INTEGER AS n FROM silver_groups WHERE group_id = 'bad-over'") == 0
+        assert _count(warehouse, "SELECT COUNT(*)::INTEGER AS n FROM silver_groups WHERE group_id = 'keep-ok'") == 1
+        assert warehouse.query("SELECT dq_status FROM silver_groups WHERE group_id = 'other-bad'")[0]["dq_status"] == "suspect"
+        archive = warehouse.query(
+            """
+            SELECT reason, removed_by, removed_at
+            FROM silver_rejects
+            WHERE _batch_id = 'batch-a' AND source_table = 'bronze_groups'
+            """
+        )[0]
+        assert archive["reason"].startswith("conversions_gt_sessions")
+        assert "engineering request" in archive["reason"]
+        assert archive["removed_by"] == "engineering"
+        assert archive["removed_at"] is not None
+        assert reconciliation_errors(warehouse, "batch-a") == []
+        audit = warehouse.query(
+            "SELECT rows_in, rows_out, rows_rejected FROM pipeline_runs WHERE batch_id = 'batch-a' AND layer = 'remove_suspect'"
+        )[0]
+        assert int(audit["rows_in"]) == int(audit["rows_out"]) + int(audit["rows_rejected"])
+        archives = _count(
+            warehouse,
+            "SELECT COUNT(*)::INTEGER AS n FROM silver_rejects WHERE _batch_id = 'batch-a' AND removed_by IS NOT NULL",
+        )
+        again = remove_suspect(warehouse, "batch-a", "engineering request")
+        assert again["removed"] == 0
+        assert _count(
+            warehouse,
+            "SELECT COUNT(*)::INTEGER AS n FROM silver_rejects WHERE _batch_id = 'batch-a' AND removed_by IS NOT NULL",
+        ) == archives
+        assert _count(warehouse, "SELECT COUNT(*)::INTEGER AS n FROM silver_groups WHERE group_id = 'keep-ok'") == 1
+        assert reconciliation_errors(warehouse, "batch-a") == []
+    finally:
+        warehouse.close()
+
+    code = main(
+        ["remove-suspect", "batch-b", "--reason", "engineering request", "--db", str(tmp_path / "dq.duckdb")]
+    )
+    assert code == 0
+    check = DuckDBWarehouse(tmp_path / "dq.duckdb")
+    try:
+        assert _count(check, "SELECT COUNT(*)::INTEGER AS n FROM silver_groups WHERE group_id = 'other-bad'") == 0
+        assert reconciliation_errors(check, "batch-b") == []
+    finally:
+        check.close()
+
+
+def _pii_ticket() -> tuple:
+    return (
+        "t-pii",
+        datetime(2026, 11, 22, 18, 0, 0),
+        "android",
+        "IN",
+        "app",
+        "upi",
+        "SKU-100",
+        "4.2.1",
+        "payments",
+        "Email me at jane.doe@example.com about the failed payment.",
+    )
+
+
+def test_external_copy_audits_a_real_batch_and_a_noop_writes_nothing(tmp_path):
+    from signal_service.pipeline.ddl import ensure_objects
+    from signal_service.pipeline.external_backfill import promote_legacy_external_events
+    from signal_service.signals.tables import ensure_signal_tables
+
+    warehouse = DuckDBWarehouse(tmp_path / "audit.duckdb")
+    try:
+        ensure_objects(warehouse)
+        ensure_signal_tables(warehouse)
+        warehouse.execute("DELETE FROM pipeline_runs")
+        warehouse.execute(
+            """
+            INSERT INTO signals.external_events (
+                event_id, case_id, title, summary, source_url, source_type, relevance,
+                observed_at, metric, provider
+            ) VALUES
+            ('ext-audit-1', 'C-1', 'UPI outage', 'Banks report failures', 'https://example.com/a', 'web', 0.9, TIMESTAMP '2026-11-20 02:00:00', 'checkout_conversion', 'mock'),
+            ('ext-audit-2', 'C-1', 'Status page', 'Elevated errors', 'https://example.com/b', 'x', 0.8, TIMESTAMP '2026-11-20 02:05:00', 'checkout_conversion', 'mock')
+            """
+        )
+        promote_legacy_external_events(warehouse)
+        runs = warehouse.query(
+            """
+            SELECT batch_id, rows_in, rows_out, rows_rejected, status
+            FROM pipeline_runs
+            WHERE layer = 'silver'
+            """
+        )
+        assert len(runs) == 1
+        run = runs[0]
+        assert run["batch_id"] == "legacy-external"
+        assert run["batch_id"] != "pending"
+        assert int(run["rows_in"]) == int(run["rows_out"]) + int(run["rows_rejected"])
+        assert int(run["rows_in"]) == 2
+        assert run["status"] == "success"
+        promote_legacy_external_events(warehouse)
+        assert _count(warehouse, "SELECT COUNT(*)::INTEGER AS n FROM pipeline_runs") == 1
+    finally:
+        warehouse.close()
+
+
+def test_null_load_writes_no_pipeline_run_on_the_noop_path():
+    procedure = medallion_statements("procedure")[0]
+    upper = procedure.upper()
+    null_at = upper.find("IF (V_BATCH IS NULL)")
+    noop_at = upper.find("RETURN 'NOOP'", null_at)
+    assert null_at > 0 and noop_at > null_at
+    noop_branch = upper[null_at:noop_at]
+    assert "INSERT INTO MCP_DB.SIGNAL_SANDBOX.PIPELINE_RUNS" not in noop_branch
+    moving = upper[noop_at:]
+    assert "INSERT INTO MCP_DB.SIGNAL_SANDBOX.PIPELINE_RUNS" in moving
+    assert "COUNTED.BATCH_ID" in moving
+    assert "'PENDING'" not in upper
 
 
 def test_null_batch_consumes_streams_and_never_writes_pending():
@@ -545,7 +732,7 @@ def test_task_ddl_is_a_single_load_staging_call():
         assert folded.count(" CALL ") == 1
         assert "CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(NULL)" in folded
     procedures = medallion_statements("procedure")
-    assert len(procedures) == 2
+    assert len(procedures) == 3
     load_staging = procedures[0]
     rerun_staging = procedures[1]
     assert re.search(r"LOAD_STAGING\s*\(\s*batch\s+VARCHAR\s*\)", load_staging, re.IGNORECASE)

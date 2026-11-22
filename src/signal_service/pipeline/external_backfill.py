@@ -16,6 +16,7 @@ def promote_legacy_external_events(warehouse) -> dict:
 
     ensure_signal_tables(warehouse)
     before = _count(warehouse, "SELECT COUNT(*)::INTEGER AS n FROM bronze_external_events")
+    silver_before = _count(warehouse, "SELECT COUNT(*)::INTEGER AS n FROM silver_external_events")
     if getattr(warehouse, "backend", "duckdb") == "snowflake":
         from signal_service.pipeline.ddl import medallion_statements
 
@@ -25,6 +26,10 @@ def promote_legacy_external_events(warehouse) -> dict:
     for statement in statements:
         warehouse.execute(statement)
     after = _count(warehouse, "SELECT COUNT(*)::INTEGER AS n FROM bronze_external_events")
+    silver_after = _count(warehouse, "SELECT COUNT(*)::INTEGER AS n FROM silver_external_events")
+    inserted = after - before
+    if inserted > 0:
+        _audit_copy(warehouse, inserted, max(0, silver_after - silver_before))
     visible = _count(
         warehouse,
         """
@@ -111,6 +116,35 @@ def duckdb_backfill_statements() -> list[str]:
           )
         """,
     ]
+
+
+def _audit_copy(warehouse, inserted: int, landed: int) -> None:
+    """Record a copy that moved rows. A later no-op copy does not call this."""
+    from signal_service.pipeline.propagate import clock, write_run
+
+    rows = warehouse.query(
+        """
+        SELECT _batch_id AS batch_id
+        FROM bronze_external_events
+        WHERE _source = ?
+          AND _batch_id IS NOT NULL
+        ORDER BY _ingested_at DESC
+        LIMIT 1
+        """,
+        [LEGACY_EXTERNAL_SOURCE],
+    )
+    batch_id = rows[0]["batch_id"] if rows else LEGACY_EXTERNAL_BATCH
+    rows_out = min(inserted, landed)
+    write_run(
+        warehouse,
+        batch_id=str(batch_id),
+        layer="silver",
+        started_at=clock(),
+        status="success",
+        rows_in=inserted,
+        rows_out=rows_out,
+        rows_rejected=inserted - rows_out,
+    )
 
 
 def _batch_sql(value: str) -> str:

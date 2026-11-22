@@ -31,6 +31,7 @@ def test_dashboard_page_and_gold_data(demo_wh):
     page = client.get("/dashboard")
     assert page.status_code == 200
     html = page.text
+    assert "Data quality" in html
     assert "chart.js" in html
     assert "60000" in html
     assert "Load new data" in html

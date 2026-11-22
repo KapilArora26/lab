@@ -1,9 +1,9 @@
 -- Medallion objects inside MCP_DB.SIGNAL_SANDBOX only.
 -- Bronze is append-only. Silver and gold rows carry _loaded_at and _batch_id.
 --
--- ALTER TASK ... RESUME is the only ALTER in this file. Tasks are created
--- suspended, and RESUME is what lets them see streams. There is no DROP,
--- TRUNCATE, GRANT, or ALTER TABLE. Each task body is one statement:
+-- ALTER TABLE ... ADD COLUMN is additive. ALTER TASK ... RESUME is how a new
+-- task starts, because tasks are created suspended. There is no DROP,
+-- TRUNCATE, or GRANT. Each task body is one statement:
 -- CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(NULL). A null batch reads every
 -- stream with DML inside one transaction so the offset advances on commit,
 -- then loads only batch ids that do not already have a gold success. It does
@@ -297,6 +297,42 @@ CREATE TABLE IF NOT EXISTS MCP_DB.SIGNAL_SANDBOX.STREAM_BATCH_QUEUE (
     batch_id VARCHAR
 );
 
+ALTER TABLE MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS ADD COLUMN IF NOT EXISTS dq_status VARCHAR DEFAULT 'ok';
+
+ALTER TABLE MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS ADD COLUMN IF NOT EXISTS dq_reason VARCHAR;
+
+ALTER TABLE MCP_DB.SIGNAL_SANDBOX.SILVER_SUPPORT_TICKETS ADD COLUMN IF NOT EXISTS dq_status VARCHAR DEFAULT 'ok';
+
+ALTER TABLE MCP_DB.SIGNAL_SANDBOX.SILVER_SUPPORT_TICKETS ADD COLUMN IF NOT EXISTS dq_reason VARCHAR;
+
+ALTER TABLE MCP_DB.SIGNAL_SANDBOX.SILVER_DEPLOYS ADD COLUMN IF NOT EXISTS dq_status VARCHAR DEFAULT 'ok';
+
+ALTER TABLE MCP_DB.SIGNAL_SANDBOX.SILVER_DEPLOYS ADD COLUMN IF NOT EXISTS dq_reason VARCHAR;
+
+ALTER TABLE MCP_DB.SIGNAL_SANDBOX.SILVER_DEMO_META ADD COLUMN IF NOT EXISTS dq_status VARCHAR DEFAULT 'ok';
+
+ALTER TABLE MCP_DB.SIGNAL_SANDBOX.SILVER_DEMO_META ADD COLUMN IF NOT EXISTS dq_reason VARCHAR;
+
+ALTER TABLE MCP_DB.SIGNAL_SANDBOX.SILVER_GOLDEN_TICKETS ADD COLUMN IF NOT EXISTS dq_status VARCHAR DEFAULT 'ok';
+
+ALTER TABLE MCP_DB.SIGNAL_SANDBOX.SILVER_GOLDEN_TICKETS ADD COLUMN IF NOT EXISTS dq_reason VARCHAR;
+
+ALTER TABLE MCP_DB.SIGNAL_SANDBOX.SILVER_EXTERNAL_EVENTS ADD COLUMN IF NOT EXISTS dq_status VARCHAR DEFAULT 'ok';
+
+ALTER TABLE MCP_DB.SIGNAL_SANDBOX.SILVER_EXTERNAL_EVENTS ADD COLUMN IF NOT EXISTS dq_reason VARCHAR;
+
+ALTER TABLE MCP_DB.SIGNAL_SANDBOX.SILVER_REJECTS ADD COLUMN IF NOT EXISTS row_key VARCHAR;
+
+ALTER TABLE MCP_DB.SIGNAL_SANDBOX.SILVER_REJECTS ADD COLUMN IF NOT EXISTS removed_by VARCHAR;
+
+ALTER TABLE MCP_DB.SIGNAL_SANDBOX.SILVER_REJECTS ADD COLUMN IF NOT EXISTS removed_at TIMESTAMP_NTZ;
+
+ALTER TABLE MCP_DB.SIGNAL_SANDBOX.GOLD_HOURLY_CONVERSION ADD COLUMN IF NOT EXISTS dq_suspect_rows INTEGER DEFAULT 0;
+
+ALTER TABLE MCP_DB.SIGNAL_SANDBOX.GOLD_REVENUE_AT_RISK ADD COLUMN IF NOT EXISTS dq_suspect_rows INTEGER DEFAULT 0;
+
+ALTER TABLE MCP_DB.SIGNAL_SANDBOX.GOLD_DAILY_SPEND ADD COLUMN IF NOT EXISTS dq_suspect_rows INTEGER DEFAULT 0;
+
 CREATE OR REPLACE VIEW MCP_DB.SIGNAL_SANDBOX.SILVER_SESSIONS AS
 SELECT
     's-' || g.group_id || '-' || f.index::VARCHAR AS session_id,
@@ -310,7 +346,17 @@ SELECT
     f.index < g.n_convert AS converted,
     g._batch_id,
     g._loaded_at
-FROM MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS g,
+FROM (
+    SELECT * FROM MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS
+    WHERE n_sessions >= 0
+      AND n_convert >= 0
+      AND n_attempt >= 0
+      AND n_sessions >= n_convert
+      AND n_attempt >= n_convert
+      AND hour IS NOT NULL
+      AND platform IS NOT NULL
+      AND country IS NOT NULL
+) g,
 LATERAL FLATTEN(INPUT => ARRAY_GENERATE_RANGE(0, g.n_sessions)) f;
 
 CREATE OR REPLACE VIEW MCP_DB.SIGNAL_SANDBOX.SILVER_PAYMENTS AS
@@ -337,7 +383,17 @@ SELECT
     g.app_version,
     g._batch_id,
     g._loaded_at
-FROM MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS g,
+FROM (
+    SELECT * FROM MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS
+    WHERE n_sessions >= 0
+      AND n_convert >= 0
+      AND n_attempt >= 0
+      AND n_sessions >= n_convert
+      AND n_attempt >= n_convert
+      AND hour IS NOT NULL
+      AND platform IS NOT NULL
+      AND country IS NOT NULL
+) g,
 LATERAL FLATTEN(INPUT => ARRAY_GENERATE_RANGE(0, g.n_attempt)) f;
 
 CREATE OR REPLACE VIEW MCP_DB.SIGNAL_SANDBOX.SILVER_ORDERS AS
@@ -357,7 +413,17 @@ SELECT
     'paid' AS status,
     g._batch_id,
     g._loaded_at
-FROM MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS g,
+FROM (
+    SELECT * FROM MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS
+    WHERE n_sessions >= 0
+      AND n_convert >= 0
+      AND n_attempt >= 0
+      AND n_sessions >= n_convert
+      AND n_attempt >= n_convert
+      AND hour IS NOT NULL
+      AND platform IS NOT NULL
+      AND country IS NOT NULL
+) g,
 LATERAL FLATTEN(INPUT => ARRAY_GENERATE_RANGE(0, g.n_convert)) f;
 
 CREATE OR REPLACE VIEW MCP_DB.SIGNAL_SANDBOX.SESSIONS AS
@@ -376,6 +442,32 @@ SELECT
     app_version, amount_usd, status
 FROM MCP_DB.SIGNAL_SANDBOX.SILVER_ORDERS;
 
+CREATE OR REPLACE VIEW MCP_DB.SIGNAL_SANDBOX.GOLD_DATA_QUALITY AS
+SELECT _batch_id AS batch_id, 'groups' AS "table", group_id::VARCHAR AS "key",
+       dq_reason AS reason, _loaded_at AS first_seen
+FROM MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS
+WHERE dq_status = 'suspect'
+UNION ALL
+SELECT _batch_id, 'support_tickets', ticket_id::VARCHAR, dq_reason, _loaded_at
+FROM MCP_DB.SIGNAL_SANDBOX.SILVER_SUPPORT_TICKETS
+WHERE dq_status = 'suspect'
+UNION ALL
+SELECT _batch_id, 'deploys', deploy_id::VARCHAR, dq_reason, _loaded_at
+FROM MCP_DB.SIGNAL_SANDBOX.SILVER_DEPLOYS
+WHERE dq_status = 'suspect'
+UNION ALL
+SELECT _batch_id, 'demo_meta', key::VARCHAR, dq_reason, _loaded_at
+FROM MCP_DB.SIGNAL_SANDBOX.SILVER_DEMO_META
+WHERE dq_status = 'suspect'
+UNION ALL
+SELECT _batch_id, 'golden_tickets', example_id::VARCHAR, dq_reason, _loaded_at
+FROM MCP_DB.SIGNAL_SANDBOX.SILVER_GOLDEN_TICKETS
+WHERE dq_status = 'suspect'
+UNION ALL
+SELECT _batch_id, 'external_events', event_id::VARCHAR, dq_reason, _loaded_at
+FROM MCP_DB.SIGNAL_SANDBOX.SILVER_EXTERNAL_EVENTS
+WHERE dq_status = 'suspect';
+
 CREATE OR REPLACE VIEW MCP_DB.SIGNAL_SANDBOX.GOLD_HEALTH AS
 SELECT 'bronze' AS layer,
        (SELECT COUNT(*) FROM MCP_DB.SIGNAL_SANDBOX.BRONZE_GROUPS) AS row_count,
@@ -385,7 +477,8 @@ SELECT 'bronze' AS layer,
            WHERE layer = 'bronze'
            ORDER BY started_at DESC
            LIMIT 1
-       ) AS latest_status
+       ) AS latest_status,
+       0 AS suspect_rows
 UNION ALL
 SELECT 'silver',
        (SELECT COUNT(*) FROM MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS),
@@ -395,7 +488,8 @@ SELECT 'silver',
            WHERE layer = 'silver'
            ORDER BY started_at DESC
            LIMIT 1
-       )
+       ),
+       (SELECT COUNT(*) FROM MCP_DB.SIGNAL_SANDBOX.GOLD_DATA_QUALITY)
 UNION ALL
 SELECT 'gold',
        (SELECT COUNT(*) FROM MCP_DB.SIGNAL_SANDBOX.GOLD_HOURLY_CONVERSION),
@@ -405,7 +499,8 @@ SELECT 'gold',
            WHERE layer = 'gold'
            ORDER BY started_at DESC
            LIMIT 1
-       );
+       ),
+       (SELECT COALESCE(SUM(dq_suspect_rows), 0) FROM MCP_DB.SIGNAL_SANDBOX.GOLD_HOURLY_CONVERSION);
 
 CREATE OR REPLACE VIEW MCP_DB.SIGNAL_SANDBOX.GOLD_PIPELINE_LAG AS
 WITH bronze AS (
@@ -651,6 +746,8 @@ BEGIN
                 AND r.status = 'success'
           );
         IF (NOT EXISTS (SELECT 1 FROM MCP_DB.SIGNAL_SANDBOX.STREAM_BATCH_QUEUE)) THEN
+            -- Stream offset advanced and no new batch was loaded. A no-op
+            -- writes no PIPELINE_RUNS row.
             COMMIT;
             RETURN 'noop';
         END IF;
@@ -739,22 +836,25 @@ BEGIN
     END IF;
 
     DELETE FROM MCP_DB.SIGNAL_SANDBOX.SILVER_REJECTS
+    WHERE _batch_id IN (SELECT batch_id FROM MCP_DB.SIGNAL_SANDBOX.STREAM_BATCH_QUEUE)
+      AND removed_by IS NULL;
+
+    DELETE FROM MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS
     WHERE _batch_id IN (SELECT batch_id FROM MCP_DB.SIGNAL_SANDBOX.STREAM_BATCH_QUEUE);
 
-    INSERT INTO MCP_DB.SIGNAL_SANDBOX.SILVER_REJECTS (
-        reject_id, source_table, row_json, reason, _loaded_at, _batch_id
+    INSERT INTO MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS (
+        group_id, hour, platform, country, channel, payment_method, sku, app_version,
+        n_sessions, n_convert, n_attempt, _loaded_at, _batch_id, dq_status, dq_reason
     )
     SELECT
-        'bronze_groups:' || :v_run || ':' || group_id,
-        'bronze_groups',
-        '{"group_id":"' || COALESCE(group_id, '') || '"}',
-        reason,
-        :v_loaded,
-        _batch_id
+        group_id, hour, platform, country, channel, payment_method, sku, app_version,
+        n_sessions, n_convert, n_attempt, :v_loaded, _batch_id,
+        CASE WHEN reason IS NULL THEN 'ok' ELSE 'suspect' END,
+        reason
     FROM (
         SELECT
-            group_id,
-            _batch_id,
+            group_id, hour, platform, country, channel, payment_method, sku, app_version,
+            n_sessions, n_convert, n_attempt, _batch_id,
             CASE
                 WHEN group_id IS NULL THEN 'null group_id'
                 WHEN hour IS NULL THEN 'null hour'
@@ -768,45 +868,23 @@ BEGIN
             END AS reason
         FROM (
             SELECT
-                group_id, hour, platform, country, n_sessions, n_convert, n_attempt, _batch_id,
-                ROW_NUMBER() OVER (PARTITION BY group_id ORDER BY _ingested_at) AS rn
-            FROM MCP_DB.SIGNAL_SANDBOX.BRONZE_GROUPS
-            WHERE _batch_id IN (SELECT batch_id FROM MCP_DB.SIGNAL_SANDBOX.STREAM_BATCH_QUEUE)
-        )
-    )
-    WHERE reason IS NOT NULL;
-
-    MERGE INTO MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS t
-    USING (
-        SELECT group_id, hour, platform, country, channel, payment_method, sku, app_version,
-               n_sessions, n_convert, n_attempt, _batch_id
-        FROM (
-            SELECT
                 group_id, hour, platform, country, channel, payment_method, sku, app_version,
                 n_sessions, n_convert, n_attempt, _batch_id,
                 ROW_NUMBER() OVER (PARTITION BY group_id ORDER BY _ingested_at) AS rn
-            FROM MCP_DB.SIGNAL_SANDBOX.BRONZE_GROUPS
-            WHERE _batch_id IN (SELECT batch_id FROM MCP_DB.SIGNAL_SANDBOX.STREAM_BATCH_QUEUE)
-              AND group_id IS NOT NULL
-              AND hour IS NOT NULL
-              AND platform IS NOT NULL
-              AND country IS NOT NULL
-              AND n_sessions >= 0
-              AND n_convert >= 0
-              AND n_attempt >= 0
-              AND n_attempt >= n_convert
-              AND n_sessions >= n_convert
+            FROM MCP_DB.SIGNAL_SANDBOX.BRONZE_GROUPS src
+            WHERE src._batch_id IN (SELECT batch_id FROM MCP_DB.SIGNAL_SANDBOX.STREAM_BATCH_QUEUE)
         )
-        WHERE rn = 1
-    ) s
-    ON t.group_id = s.group_id
-    WHEN NOT MATCHED THEN INSERT (
-        group_id, hour, platform, country, channel, payment_method, sku, app_version,
-        n_sessions, n_convert, n_attempt, _loaded_at, _batch_id
-    ) VALUES (
-        s.group_id, s.hour, s.platform, s.country, s.channel, s.payment_method, s.sku, s.app_version,
-        s.n_sessions, s.n_convert, s.n_attempt, :v_loaded, s._batch_id
-    );
+    ) flagged
+    WHERE flagged.reason IS NULL
+       OR NOT EXISTS (
+            SELECT 1
+            FROM MCP_DB.SIGNAL_SANDBOX.SILVER_REJECTS removed
+            WHERE removed._batch_id = flagged._batch_id
+              AND removed.source_table = 'bronze_groups'
+              AND removed.removed_by IS NOT NULL
+              AND removed.row_key = flagged.group_id
+              AND STARTSWITH(removed.reason, flagged.reason)
+       );
 
     INSERT INTO MCP_DB.SIGNAL_SANDBOX.SILVER_REJECTS (
         reject_id, source_table, row_json, reason, _loaded_at, _batch_id
@@ -1018,7 +1096,7 @@ BEGIN
     INSERT INTO MCP_DB.SIGNAL_SANDBOX.GOLD_HOURLY_CONVERSION (
         hour, platform, country, payment_method, app_version,
         sessions, converted, conversion_rate, baseline_rate, seasonal_index, expected_rate,
-        is_anomaly, _batch_id, _loaded_at
+        is_anomaly, dq_suspect_rows, _batch_id, _loaded_at
     )
     SELECT
         hour_ts, platform, country, payment_method, app_version,
@@ -1030,12 +1108,13 @@ BEGIN
             WHEN baseline_rate IS NOT NULL AND sessions >= 100 AND conversion_rate <= baseline_rate * 0.9 THEN TRUE
             ELSE FALSE
         END,
+        dq_suspect_rows,
         batch_key,
         :v_loaded
     FROM (
         SELECT
             hour_ts, platform, country, payment_method, app_version,
-            sessions, converted, conversion_rate, batch_key,
+            sessions, converted, conversion_rate, batch_key, dq_suspect_rows,
             AVG(conversion_rate) OVER (
                 PARTITION BY platform, country, payment_method, app_version, DATE_PART('hour', hour_ts)
                 ORDER BY hour_ts
@@ -1054,6 +1133,7 @@ BEGIN
                 SUM(n_sessions) AS sessions,
                 SUM(n_convert) AS converted,
                 SUM(n_convert)::DOUBLE / NULLIF(SUM(n_sessions), 0) AS conversion_rate,
+                SUM(CASE WHEN COALESCE(dq_status, 'ok') = 'suspect' THEN 1 ELSE 0 END) AS dq_suspect_rows,
                 MIN(_batch_id) AS batch_key
             FROM MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS
             GROUP BY hour, platform, country, payment_method, app_version
@@ -1063,7 +1143,7 @@ BEGIN
 
     INSERT INTO MCP_DB.SIGNAL_SANDBOX.GOLD_REVENUE_AT_RISK (
         hour, platform, country, payment_method, app_version,
-        lost_conversions, aov_usd, session_weight, revenue_at_risk_usd, _batch_id, _loaded_at
+        lost_conversions, aov_usd, session_weight, revenue_at_risk_usd, dq_suspect_rows, _batch_id, _loaded_at
     )
     SELECT
         hour,
@@ -1083,6 +1163,7 @@ BEGIN
                 * COALESCE((SELECT MAX(value::DOUBLE) FROM MCP_DB.SIGNAL_SANDBOX.SILVER_DEMO_META WHERE key = 'aov_usd'), 48)
                 * COALESCE((SELECT MAX(value::DOUBLE) FROM MCP_DB.SIGNAL_SANDBOX.SILVER_DEMO_META WHERE key = 'session_weight'), 1)
         END,
+        dq_suspect_rows,
         _batch_id,
         :v_loaded
     FROM MCP_DB.SIGNAL_SANDBOX.GOLD_HOURLY_CONVERSION
@@ -1163,6 +1244,127 @@ BEGIN
     DELETE FROM MCP_DB.SIGNAL_SANDBOX.PIPELINE_RUNS
     WHERE batch_id = :v_batch AND layer = 'gold' AND status = 'success';
     CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(:v_batch);
+    RETURN 'ok';
+END;
+$$;
+
+-- One signature. Engineering asks for a batch, and an optional note is the
+-- second argument. There is no overload and no default parameter.
+CREATE OR REPLACE PROCEDURE MCP_DB.SIGNAL_SANDBOX.REMOVE_SUSPECT(batch VARCHAR, reason VARCHAR)
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+    v_batch VARCHAR;
+    v_reason VARCHAR;
+    v_loaded TIMESTAMP_NTZ;
+    v_removed NUMBER;
+BEGIN
+    v_batch := batch;
+    v_reason := COALESCE(reason, 'removed on request');
+    v_loaded := CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ;
+    IF (v_batch IS NULL) THEN
+        RETURN 'batch is required';
+    END IF;
+
+    INSERT INTO MCP_DB.SIGNAL_SANDBOX.SILVER_REJECTS (
+        reject_id, source_table, row_json, reason, _loaded_at, _batch_id, row_key, removed_by, removed_at
+    )
+    SELECT
+        'remove:' || :v_batch || ':' || source_table || ':' || COALESCE(row_key, 'row'),
+        source_table,
+        row_json,
+        COALESCE(dq_reason, 'suspect') || '; ' || :v_reason,
+        :v_loaded,
+        :v_batch,
+        row_key,
+        'engineering',
+        :v_loaded
+    FROM (
+        SELECT 'bronze_groups' AS source_table, group_id AS row_key,
+               '{"group_id":"' || COALESCE(group_id, '') || '"}' AS row_json, dq_reason
+        FROM MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS
+        WHERE _batch_id = :v_batch AND dq_status = 'suspect'
+        UNION ALL
+        SELECT 'bronze_support_tickets', ticket_id,
+               '{"ticket_id":"' || COALESCE(ticket_id, '') || '"}', dq_reason
+        FROM MCP_DB.SIGNAL_SANDBOX.SILVER_SUPPORT_TICKETS
+        WHERE _batch_id = :v_batch AND dq_status = 'suspect'
+        UNION ALL
+        SELECT 'bronze_deploys', deploy_id,
+               '{"deploy_id":"' || COALESCE(deploy_id, '') || '"}', dq_reason
+        FROM MCP_DB.SIGNAL_SANDBOX.SILVER_DEPLOYS
+        WHERE _batch_id = :v_batch AND dq_status = 'suspect'
+        UNION ALL
+        SELECT 'bronze_demo_meta', key,
+               '{"key":"' || COALESCE(key, '') || '"}', dq_reason
+        FROM MCP_DB.SIGNAL_SANDBOX.SILVER_DEMO_META
+        WHERE _batch_id = :v_batch AND dq_status = 'suspect'
+        UNION ALL
+        SELECT 'bronze_golden_tickets', example_id,
+               '{"example_id":"' || COALESCE(example_id, '') || '"}', dq_reason
+        FROM MCP_DB.SIGNAL_SANDBOX.SILVER_GOLDEN_TICKETS
+        WHERE _batch_id = :v_batch AND dq_status = 'suspect'
+        UNION ALL
+        SELECT 'bronze_external_events', event_id,
+               '{"event_id":"' || COALESCE(event_id, '') || '"}', dq_reason
+        FROM MCP_DB.SIGNAL_SANDBOX.SILVER_EXTERNAL_EVENTS
+        WHERE _batch_id = :v_batch AND dq_status = 'suspect'
+    );
+
+    v_removed := (
+        SELECT COUNT(*) FROM MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS
+        WHERE _batch_id = :v_batch AND dq_status = 'suspect'
+    ) + (
+        SELECT COUNT(*) FROM MCP_DB.SIGNAL_SANDBOX.SILVER_SUPPORT_TICKETS
+        WHERE _batch_id = :v_batch AND dq_status = 'suspect'
+    ) + (
+        SELECT COUNT(*) FROM MCP_DB.SIGNAL_SANDBOX.SILVER_DEPLOYS
+        WHERE _batch_id = :v_batch AND dq_status = 'suspect'
+    ) + (
+        SELECT COUNT(*) FROM MCP_DB.SIGNAL_SANDBOX.SILVER_DEMO_META
+        WHERE _batch_id = :v_batch AND dq_status = 'suspect'
+    ) + (
+        SELECT COUNT(*) FROM MCP_DB.SIGNAL_SANDBOX.SILVER_GOLDEN_TICKETS
+        WHERE _batch_id = :v_batch AND dq_status = 'suspect'
+    ) + (
+        SELECT COUNT(*) FROM MCP_DB.SIGNAL_SANDBOX.SILVER_EXTERNAL_EVENTS
+        WHERE _batch_id = :v_batch AND dq_status = 'suspect'
+    );
+
+    DELETE FROM MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS
+    WHERE _batch_id = :v_batch AND dq_status = 'suspect';
+    DELETE FROM MCP_DB.SIGNAL_SANDBOX.SILVER_SUPPORT_TICKETS
+    WHERE _batch_id = :v_batch AND dq_status = 'suspect';
+    DELETE FROM MCP_DB.SIGNAL_SANDBOX.SILVER_DEPLOYS
+    WHERE _batch_id = :v_batch AND dq_status = 'suspect';
+    DELETE FROM MCP_DB.SIGNAL_SANDBOX.SILVER_DEMO_META
+    WHERE _batch_id = :v_batch AND dq_status = 'suspect';
+    DELETE FROM MCP_DB.SIGNAL_SANDBOX.SILVER_GOLDEN_TICKETS
+    WHERE _batch_id = :v_batch AND dq_status = 'suspect';
+    DELETE FROM MCP_DB.SIGNAL_SANDBOX.SILVER_EXTERNAL_EVENTS
+    WHERE _batch_id = :v_batch AND dq_status = 'suspect';
+
+    DELETE FROM MCP_DB.SIGNAL_SANDBOX.PIPELINE_RUNS
+    WHERE batch_id = :v_batch AND layer = 'gold' AND status = 'success';
+    CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(:v_batch);
+
+    INSERT INTO MCP_DB.SIGNAL_SANDBOX.PIPELINE_RUNS (
+        run_id, batch_id, layer, started_at, finished_at, status, rows_in, rows_out, rows_rejected, error
+    ) VALUES (
+        'remove-' || UUID_STRING(),
+        :v_batch,
+        'remove_suspect',
+        :v_loaded,
+        CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ,
+        'success',
+        :v_removed,
+        0,
+        :v_removed,
+        NULL
+    );
     RETURN 'ok';
 END;
 $$;

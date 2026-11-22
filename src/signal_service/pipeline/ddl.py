@@ -311,7 +311,17 @@ _STATEMENTS = [
         r.range < g.n_convert AS converted,
         g._batch_id,
         g._loaded_at
-    FROM silver_groups g, range(g.n_sessions::BIGINT) r
+    FROM (
+        SELECT * FROM silver_groups
+        WHERE n_sessions >= 0
+          AND n_convert >= 0
+          AND n_attempt >= 0
+          AND n_sessions >= n_convert
+          AND n_attempt >= n_convert
+          AND hour IS NOT NULL
+          AND platform IS NOT NULL
+          AND country IS NOT NULL
+    ) g, range(g.n_sessions::BIGINT) r
     """,
     """
     CREATE OR REPLACE VIEW silver_payments AS
@@ -338,7 +348,17 @@ _STATEMENTS = [
         g.app_version,
         g._batch_id,
         g._loaded_at
-    FROM silver_groups g, range(g.n_attempt::BIGINT) r
+    FROM (
+        SELECT * FROM silver_groups
+        WHERE n_sessions >= 0
+          AND n_convert >= 0
+          AND n_attempt >= 0
+          AND n_sessions >= n_convert
+          AND n_attempt >= n_convert
+          AND hour IS NOT NULL
+          AND platform IS NOT NULL
+          AND country IS NOT NULL
+    ) g, range(g.n_attempt::BIGINT) r
     """,
     """
     CREATE OR REPLACE VIEW silver_orders AS
@@ -358,7 +378,17 @@ _STATEMENTS = [
         'paid' AS status,
         g._batch_id,
         g._loaded_at
-    FROM silver_groups g, range(g.n_convert::BIGINT) r
+    FROM (
+        SELECT * FROM silver_groups
+        WHERE n_sessions >= 0
+          AND n_convert >= 0
+          AND n_attempt >= 0
+          AND n_sessions >= n_convert
+          AND n_attempt >= n_convert
+          AND hour IS NOT NULL
+          AND platform IS NOT NULL
+          AND country IS NOT NULL
+    ) g, range(g.n_convert::BIGINT) r
     """,
     """
     CREATE OR REPLACE VIEW groups AS
@@ -408,6 +438,87 @@ _STATEMENTS = [
     FROM silver_golden_tickets
     """,
     """
+    ALTER TABLE silver_groups ADD COLUMN IF NOT EXISTS dq_status VARCHAR DEFAULT 'ok'
+    """,
+    """
+    ALTER TABLE silver_groups ADD COLUMN IF NOT EXISTS dq_reason VARCHAR
+    """,
+    """
+    ALTER TABLE silver_support_tickets ADD COLUMN IF NOT EXISTS dq_status VARCHAR DEFAULT 'ok'
+    """,
+    """
+    ALTER TABLE silver_support_tickets ADD COLUMN IF NOT EXISTS dq_reason VARCHAR
+    """,
+    """
+    ALTER TABLE silver_deploys ADD COLUMN IF NOT EXISTS dq_status VARCHAR DEFAULT 'ok'
+    """,
+    """
+    ALTER TABLE silver_deploys ADD COLUMN IF NOT EXISTS dq_reason VARCHAR
+    """,
+    """
+    ALTER TABLE silver_demo_meta ADD COLUMN IF NOT EXISTS dq_status VARCHAR DEFAULT 'ok'
+    """,
+    """
+    ALTER TABLE silver_demo_meta ADD COLUMN IF NOT EXISTS dq_reason VARCHAR
+    """,
+    """
+    ALTER TABLE silver_golden_tickets ADD COLUMN IF NOT EXISTS dq_status VARCHAR DEFAULT 'ok'
+    """,
+    """
+    ALTER TABLE silver_golden_tickets ADD COLUMN IF NOT EXISTS dq_reason VARCHAR
+    """,
+    """
+    ALTER TABLE silver_external_events ADD COLUMN IF NOT EXISTS dq_status VARCHAR DEFAULT 'ok'
+    """,
+    """
+    ALTER TABLE silver_external_events ADD COLUMN IF NOT EXISTS dq_reason VARCHAR
+    """,
+    """
+    ALTER TABLE silver_rejects ADD COLUMN IF NOT EXISTS row_key VARCHAR
+    """,
+    """
+    ALTER TABLE silver_rejects ADD COLUMN IF NOT EXISTS removed_by VARCHAR
+    """,
+    """
+    ALTER TABLE silver_rejects ADD COLUMN IF NOT EXISTS removed_at TIMESTAMP
+    """,
+    """
+    ALTER TABLE gold_hourly_conversion ADD COLUMN IF NOT EXISTS dq_suspect_rows INTEGER DEFAULT 0
+    """,
+    """
+    ALTER TABLE gold_revenue_at_risk ADD COLUMN IF NOT EXISTS dq_suspect_rows INTEGER DEFAULT 0
+    """,
+    """
+    ALTER TABLE gold_daily_spend ADD COLUMN IF NOT EXISTS dq_suspect_rows INTEGER DEFAULT 0
+    """,
+    """
+    CREATE OR REPLACE VIEW gold_data_quality AS
+    SELECT _batch_id AS batch_id, 'groups' AS "table", CAST(group_id AS VARCHAR) AS "key",
+           dq_reason AS reason, _loaded_at AS first_seen
+    FROM silver_groups
+    WHERE dq_status = 'suspect'
+    UNION ALL
+    SELECT _batch_id, 'support_tickets', CAST(ticket_id AS VARCHAR), dq_reason, _loaded_at
+    FROM silver_support_tickets
+    WHERE dq_status = 'suspect'
+    UNION ALL
+    SELECT _batch_id, 'deploys', CAST(deploy_id AS VARCHAR), dq_reason, _loaded_at
+    FROM silver_deploys
+    WHERE dq_status = 'suspect'
+    UNION ALL
+    SELECT _batch_id, 'demo_meta', CAST(key AS VARCHAR), dq_reason, _loaded_at
+    FROM silver_demo_meta
+    WHERE dq_status = 'suspect'
+    UNION ALL
+    SELECT _batch_id, 'golden_tickets', CAST(example_id AS VARCHAR), dq_reason, _loaded_at
+    FROM silver_golden_tickets
+    WHERE dq_status = 'suspect'
+    UNION ALL
+    SELECT _batch_id, 'external_events', CAST(event_id AS VARCHAR), dq_reason, _loaded_at
+    FROM silver_external_events
+    WHERE dq_status = 'suspect'
+    """,
+    """
     CREATE OR REPLACE VIEW gold_health AS
     SELECT 'bronze' AS layer,
            (SELECT COUNT(*) FROM bronze_groups) AS row_count,
@@ -417,7 +528,8 @@ _STATEMENTS = [
                WHERE layer = 'bronze'
                ORDER BY started_at DESC
                LIMIT 1
-           ) AS latest_status
+           ) AS latest_status,
+           0 AS suspect_rows
     UNION ALL
     SELECT 'silver',
            (SELECT COUNT(*) FROM silver_groups),
@@ -427,7 +539,8 @@ _STATEMENTS = [
                WHERE layer = 'silver'
                ORDER BY started_at DESC
                LIMIT 1
-           )
+           ),
+           (SELECT COUNT(*) FROM gold_data_quality)
     UNION ALL
     SELECT 'gold',
            (SELECT COUNT(*) FROM gold_hourly_conversion),
@@ -437,7 +550,8 @@ _STATEMENTS = [
                WHERE layer = 'gold'
                ORDER BY started_at DESC
                LIMIT 1
-           )
+           ),
+           (SELECT COALESCE(SUM(dq_suspect_rows), 0) FROM gold_hourly_conversion)
     """,
     """
     CREATE OR REPLACE VIEW gold_pipeline_lag AS
@@ -507,7 +621,7 @@ _STATEMENTS = [
     CREATE OR REPLACE VIEW gold_external_events AS
     SELECT
         event_id, case_id, title, summary, source_url, source_type, relevance,
-        observed_at, metric, provider, _batch_id, _loaded_at
+        observed_at, metric, provider, dq_status, dq_reason, _batch_id, _loaded_at
     FROM silver_external_events
     """,
 ]
