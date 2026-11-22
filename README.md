@@ -36,7 +36,8 @@ Detection is a rule. The model is used only after a case exists, and only for un
 | Ticket classifier, external search, voice | `src/signal_service/signals` and `src/signal_service/grok` |
 | Case registry, SLA, freshness, build spec, PR check | `src/signal_service/orchestration` |
 | Brief, voice script, charts, weekly page | `src/signal_service/narrative` |
-| HTTP API | `src/signal_service/api` |
+| HTTP API and dashboard chat | `src/signal_service/api` |
+| Cloud agent launch from dashboard chat | `src/signal_service/cloud_agents.py` |
 | House rules and skills for the Cursor agent | `.cursor/rules`, `.cursor/skills` |
 | Bot personas, routines, connectors, memory | `bots/` |
 
@@ -59,6 +60,27 @@ pip install -e ".[dev]"
 No API key is required. Without `XAI_API_KEY` the service uses the keyword fallback and the checked-in external-signal fixture. Without `SNOWFLAKE_PAT_TOKEN` it uses DuckDB only.
 
 ## Run locally
+
+On a Mac or Linux laptop, from the repo root:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+cp .env.example .env
+set -a
+source .env
+set +a
+python -m uvicorn signal_service.api.app:create_app --factory --host 127.0.0.1 --port 8000
+```
+
+Open [http://127.0.0.1:8000/dashboard](http://127.0.0.1:8000/dashboard).
+
+`.env.example` lists `SNOWFLAKE_PAT_TOKEN`, `XAI_API_KEY`, `CURSOR_API_KEY`, and `ENABLE_AGENT_LAUNCH` with placeholder values only. Copy it to `.env` and replace the placeholders locally. `.env` is gitignored. Leave `ENABLE_AGENT_LAUNCH` as `false` until you want the dashboard to launch a cloud agent.
+
+The first dashboard request builds `data/warehouse/demo.duckdb` when that file is missing. DuckDB does not call Snowflake. If you point this process at Snowflake, the laptop's public IP must be allowed by the Snowflake network rule.
+
+The same warehouse can be exercised without the dashboard:
 
 ```bash
 python -m signal_service.cli generate --out data/warehouse/demo.duckdb
@@ -167,7 +189,7 @@ SELECT * FROM MCP_DB.SIGNAL_SANDBOX.GOLD_PIPELINE_LAG;
 
 ## Dashboard
 
-`GET /dashboard` is a server-rendered page. Chart.js loads from a CDN and the page refreshes from `GET /v1/dashboard/data` every 60 seconds. That JSON, and the page itself, read `GOLD_*` objects. Layer progress is the audit table, not an earlier layer. Chat is `POST /v1/dashboard/chat`. It uses the same Grok client, the key from `XAI_API_KEY`, the redaction check, and the daily spend cap. With no key it answers from the gold summary with the mock client. The chosen persona is one of `bots/atlas.md`, `sentinel.md`, `diagnostician.md`, `builder.md`, or `narrator.md`. Chat cannot land a batch or write a row.
+`GET /dashboard` is a server-rendered page. Chart.js loads from a CDN and the page refreshes from `GET /v1/dashboard/data` every 60 seconds. That JSON, and the page itself, read `GOLD_*` objects. Layer progress is the audit table, not an earlier layer. Chat is `POST /v1/dashboard/chat`. It uses the same Grok client, the key from `XAI_API_KEY`, the redaction check, and the daily spend cap. With no key it answers from the gold summary with the mock client. The chosen persona is one of `bots/atlas.md`, `sentinel.md`, `diagnostician.md`, `builder.md`, or `narrator.md`. Chat cannot land a batch or write a warehouse row. When `ENABLE_AGENT_LAUNCH` is on, a confirmed request can launch a cloud agent that opens a pull request. See [Cloud agent pull requests](#cloud-agent-pull-requests).
 
 ```text
 GET /dashboard
@@ -182,6 +204,9 @@ GET /dashboard
     |
     +-- Ask --> POST /v1/dashboard/chat --> gold summary + persona
                 (read only; mock when XAI_API_KEY is unset)
+                |
+                +-- launch_cloud_agent --> Confirm cloud agent launch
+                    --> POST confirm=true --> pull request on the fixed repo
 ```
 
 ```bash
@@ -193,6 +218,14 @@ Open `http://127.0.0.1:8000/dashboard`. The monitor query is the same one the pa
 ```sql
 SELECT * FROM MCP_DB.SIGNAL_SANDBOX.PIPELINE_RUNS ORDER BY started_at DESC;
 ```
+
+## Cloud agent pull requests
+
+Dashboard chat can ask Grok to launch a Cursor cloud agent. The server calls `POST https://api.cursor.com/v1/agents` with `Authorization: Bearer` and the key from `CURSOR_API_KEY`. The repository is fixed to `https://github.com/KapilArora26/lab` and the starting ref is `main`. The request sets `autoCreatePR` and leaves `workOnCurrentBranch` false, so the agent opens a pull request from a new branch. Chat cannot change the repository or the branch.
+
+`ENABLE_AGENT_LAUNCH` defaults to off. With the flag off, or with `CURSOR_API_KEY` unset, the tool replies that launch is disabled and the read-only chat path is unchanged. With the flag on, Grok may call `launch_cloud_agent(task)`. The page then shows **Confirm cloud agent launch**. Nothing is sent to Cursor until that button is pressed. `cloud_agent_status(agent_id)` reads `GET /v1/agents/{id}` and the latest run, and it includes the pull request URL when the run has one.
+
+Every task is prefixed with a fixed preamble: never merge, never push to main, never deploy, never touch Snowflake, never print secrets. Tasks that mention merge, deploy, drop, grant, role, or secret or token exfiltration are rejected. The process allows 3 launches per hour. Keys are read from the environment only. They are not written to logs, replies, or error text.
 
 ## Deploy to Snowflake
 
@@ -278,6 +311,8 @@ Human gates, which the code will not skip:
 | Variable | Default | Role |
 | --- | --- | --- |
 | `XAI_API_KEY` | unset | Live Grok calls. Unset uses the mock. |
+| `CURSOR_API_KEY` | unset | Cursor Cloud Agents API key. Unset disables launch. |
+| `ENABLE_AGENT_LAUNCH` | off | When `true`, dashboard chat may launch a cloud agent. |
 | `GROK_MODEL` | `grok-4.7` | Chat and responses model. |
 | `GROK_VOICE_ID` | `eve` | TTS voice. |
 | `GROK_TIMEOUT_SECONDS` | `30` | HTTP timeout. |

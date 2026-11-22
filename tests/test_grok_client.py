@@ -93,6 +93,51 @@ def test_schema_failure_is_retried():
         client.classify_batch([{"id": "t1", "text": text}])
 
 
+def test_complete_returns_tool_calls_without_logging_the_prompt(caplog):
+    secret = "xai-test-key-do-not-log-654321"
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content.decode())
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "launch_cloud_agent",
+                                        "arguments": "{\"task\": \"fix the banner copy\"}",
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 7},
+            },
+        )
+
+    http = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://api.x.ai/v1")
+    client = LiveGrokClient(secret, _guard(), http=http, sleeper=lambda _delay: None)
+    with caplog.at_level(logging.INFO):
+        result = client.complete(
+            system="You can call tools.",
+            user="open a PR that fixes the banner",
+            tools=[{"type": "function", "function": {"name": "launch_cloud_agent"}}],
+        )
+    assert result["tool_calls"][0]["function"]["name"] == "launch_cloud_agent"
+    assert seen["body"]["tools"][0]["function"]["name"] == "launch_cloud_agent"
+    assert seen["body"]["tool_choice"] == "auto"
+    assert "open a PR that fixes the banner" not in caplog.text
+    assert secret not in caplog.text
+
+
 def test_circuit_breaker_does_not_call_the_api():
     calls = {"n": 0}
 
