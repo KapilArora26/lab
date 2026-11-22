@@ -534,6 +534,63 @@ def test_external_backfill_sql_is_idempotent_and_sandbox_scoped():
         assert_sandbox_write(statement)
 
 
+_BRONZE_TRIGGER_STREAMS = (
+    "STREAM_BRONZE_GROUPS",
+    "STREAM_BRONZE_SUPPORT_TICKETS",
+    "STREAM_BRONZE_DEPLOYS",
+    "STREAM_BRONZE_DEMO_META",
+    "STREAM_BRONZE_GOLDEN_TICKETS",
+    "STREAM_BRONZE_EXTERNAL_EVENTS",
+)
+
+
+def test_triggered_task_ddl_has_no_schedule_and_keeps_stream_conditions():
+    tasks = medallion_statements("task")
+    assert len(tasks) == 2
+    bronze, silver = tasks
+    for statement in tasks:
+        folded = " ".join(statement.upper().split())
+        assert "SCHEDULE" not in folded
+        assert re.search(r"\bWAREHOUSE\s*=", folded) is None
+        assert "USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = 'XSMALL'" in folded
+        assert "OVERLAP_POLICY = NO_OVERLAP" in folded
+        assert "ALLOW_OVERLAPPING_EXECUTION = TRUE" not in folded
+        assert "TARGET_COMPLETION_INTERVAL = '1 MINUTE'" in folded
+        assert "USER_TASK_MINIMUM_TRIGGER_INTERVAL_IN_SECONDS" not in folded
+        assert "WHEN" in folded
+        assert "CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(NULL)" in folded
+    bronze_folded = " ".join(bronze.upper().split())
+    silver_folded = " ".join(silver.upper().split())
+    assert "TASK_BRONZE_TO_SILVER" in bronze_folded
+    assert "TASK_SILVER_TO_GOLD" in silver_folded
+    for name in _BRONZE_TRIGGER_STREAMS:
+        assert f"SYSTEM$STREAM_HAS_DATA('MCP_DB.SIGNAL_SANDBOX.{name}')" in bronze_folded
+    assert "SYSTEM$STREAM_HAS_DATA('MCP_DB.SIGNAL_SANDBOX.STREAM_SILVER_GROUPS')" in silver_folded
+    assert "STREAM_BRONZE_" not in silver_folded
+
+    streams = medallion_statements("stream")
+    expected = set(_BRONZE_TRIGGER_STREAMS) | {"STREAM_SILVER_GROUPS"}
+    seen: set[str] = set()
+    for statement in streams:
+        folded = " ".join(statement.upper().split())
+        assert " ON TABLE " in f" {folded} "
+        assert " ON VIEW " not in f" {folded} "
+        assert "EXTERNAL TABLE" not in folded
+        assert "HYBRID" not in folded
+        for name in expected:
+            if f"STREAM {name}" in f" {folded} " or folded.startswith(f"CREATE OR REPLACE STREAM MCP_DB.SIGNAL_SANDBOX.{name} "):
+                seen.add(name)
+                source = name.removeprefix("STREAM_")
+                assert f"ON TABLE MCP_DB.SIGNAL_SANDBOX.{source}" in folded
+    assert seen == expected
+    core = " ".join(medallion_statements("core")).upper()
+    assert "HYBRID TABLE" not in core
+    assert "EXTERNAL TABLE" not in core
+    for name in expected:
+        source = name.removeprefix("STREAM_")
+        assert f"CREATE TABLE IF NOT EXISTS MCP_DB.SIGNAL_SANDBOX.{source}" in core
+
+
 def test_task_ddl_is_a_single_load_staging_call():
     tasks = medallion_statements("task")
     assert len(tasks) == 2

@@ -3,7 +3,14 @@
 --
 -- ALTER TASK ... RESUME is the only ALTER in this file. Tasks are created
 -- suspended, and RESUME is what lets them see streams. There is no DROP,
--- TRUNCATE, GRANT, or ALTER TABLE. Each task body is one statement:
+-- TRUNCATE, GRANT, or ALTER TABLE. TASK_BRONZE_TO_SILVER and
+-- TASK_SILVER_TO_GOLD are serverless triggered tasks: no SCHEDULE and no
+-- WAREHOUSE. Each WHEN clause is SYSTEM$STREAM_HAS_DATA on table streams,
+-- so the task runs when those streams get rows. TARGET_COMPLETION_INTERVAL
+-- is required for a serverless triggered task. OVERLAP_POLICY = NO_OVERLAP
+-- is ALLOW_OVERLAPPING_EXECUTION = FALSE. The minimum trigger interval stays
+-- at the Snowflake default (30 seconds). This file does not set an account
+-- parameter. Each task body is one statement:
 -- CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(NULL). A null batch reads every
 -- stream with DML inside one transaction so the offset advances on commit,
 -- then loads only batch ids that do not already have a gold success. It does
@@ -560,6 +567,13 @@ WHEN NOT MATCHED THEN INSERT (
 );
 
 -- @section stream
+
+-- Trigger sources for the tasks below. Every stream is ON TABLE. Table
+-- streams are a supported triggered-task source, and CREATE STREAM ON TABLE
+-- enables change tracking on that table, so no ALTER is required. A stream
+-- on a view would need CHANGE_TRACKING on the view and its base tables.
+-- Hybrid tables and streams on external tables are unsupported and are not
+-- created here.
 
 CREATE OR REPLACE STREAM MCP_DB.SIGNAL_SANDBOX.STREAM_BRONZE_GROUPS
     ON TABLE MCP_DB.SIGNAL_SANDBOX.BRONZE_GROUPS
@@ -1169,9 +1183,16 @@ $$;
 
 -- @section task
 
+-- Triggered tasks. SCHEDULE is omitted on purpose. The WHEN clause is the
+-- trigger. TARGET_COMPLETION_INTERVAL is the serverless completion target
+-- (required when WAREHOUSE is omitted). It is not a poll interval.
+-- OVERLAP_POLICY = NO_OVERLAP keeps a single run at a time
+-- (ALLOW_OVERLAPPING_EXECUTION = FALSE). No account parameter is set.
+
 CREATE OR REPLACE TASK MCP_DB.SIGNAL_SANDBOX.TASK_BRONZE_TO_SILVER
-    SCHEDULE = '1 MINUTE'
     USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = 'XSMALL'
+    OVERLAP_POLICY = NO_OVERLAP
+    TARGET_COMPLETION_INTERVAL = '1 MINUTE'
     WHEN SYSTEM$STREAM_HAS_DATA('MCP_DB.SIGNAL_SANDBOX.STREAM_BRONZE_GROUPS')
       OR SYSTEM$STREAM_HAS_DATA('MCP_DB.SIGNAL_SANDBOX.STREAM_BRONZE_SUPPORT_TICKETS')
       OR SYSTEM$STREAM_HAS_DATA('MCP_DB.SIGNAL_SANDBOX.STREAM_BRONZE_DEPLOYS')
@@ -1182,8 +1203,9 @@ AS
     CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(NULL);
 
 CREATE OR REPLACE TASK MCP_DB.SIGNAL_SANDBOX.TASK_SILVER_TO_GOLD
-    SCHEDULE = '1 MINUTE'
     USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = 'XSMALL'
+    OVERLAP_POLICY = NO_OVERLAP
+    TARGET_COMPLETION_INTERVAL = '1 MINUTE'
     WHEN SYSTEM$STREAM_HAS_DATA('MCP_DB.SIGNAL_SANDBOX.STREAM_SILVER_GROUPS')
 AS
     CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(NULL);
