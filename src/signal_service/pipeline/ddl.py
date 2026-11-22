@@ -477,6 +477,33 @@ _STATEMENTS = [
     ALTER TABLE silver_rejects ADD COLUMN IF NOT EXISTS row_key VARCHAR
     """,
     """
+    ALTER TABLE silver_groups ADD COLUMN IF NOT EXISTS row_key VARCHAR
+    """,
+    """
+    ALTER TABLE silver_support_tickets ADD COLUMN IF NOT EXISTS row_key VARCHAR
+    """,
+    """
+    ALTER TABLE silver_deploys ADD COLUMN IF NOT EXISTS row_key VARCHAR
+    """,
+    """
+    ALTER TABLE silver_demo_meta ADD COLUMN IF NOT EXISTS row_key VARCHAR
+    """,
+    """
+    ALTER TABLE silver_golden_tickets ADD COLUMN IF NOT EXISTS row_key VARCHAR
+    """,
+    """
+    ALTER TABLE silver_external_events ADD COLUMN IF NOT EXISTS row_key VARCHAR
+    """,
+    """
+    ALTER TABLE silver_spend ADD COLUMN IF NOT EXISTS dq_status VARCHAR DEFAULT 'ok'
+    """,
+    """
+    ALTER TABLE silver_spend ADD COLUMN IF NOT EXISTS dq_reason VARCHAR
+    """,
+    """
+    ALTER TABLE silver_spend ADD COLUMN IF NOT EXISTS row_key VARCHAR
+    """,
+    """
     ALTER TABLE silver_rejects ADD COLUMN IF NOT EXISTS removed_by VARCHAR
     """,
     """
