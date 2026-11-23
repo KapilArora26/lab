@@ -10,20 +10,22 @@ from __future__ import annotations
 import re
 from datetime import datetime
 
-from signal_service.pipeline.ddl import medallion_statements
+from signal_service.pipeline.ddl import ensure_objects, medallion_statements
 from signal_service.pipeline.ingest import Batch, ingest_batch, rerun_batch
 from signal_service.pipeline.quality import remove_suspect
 from signal_service.pipeline.reconcile import reconciliation_errors
+from signal_service.pipeline.row_keys import procedure_row_key, row_key_payload, row_key_sql
+from signal_service.pipeline.segments import canonical_countries, canonical_platforms
 from signal_service.pipeline.stream_guard import stream_load_action
 from signal_service.warehouse.duckdb import DuckDBWarehouse
 
 
-def _row(group_id, hour, sessions=100, converted=8, attempts=12):
+def _row(group_id, hour, sessions=100, converted=8, attempts=12, platform="android", country="IN"):
     return (
         group_id,
         hour,
-        "android",
-        "IN",
+        platform,
+        country,
         "app",
         "upi",
         "SKU-100",
@@ -239,6 +241,233 @@ def test_out_of_range_timestamps_are_suspect_and_remove_clears_them(tmp_path):
         assert reconciliation_errors(warehouse, batch_id) == []
         second = remove_suspect(warehouse, batch_id, "engineering request")
         assert second["removed"] == 0
+    finally:
+        warehouse.close()
+
+
+def test_typo_platform_and_country_are_suspect_and_removed(tmp_path):
+    assert canonical_platforms() == ("android", "ios", "web")
+    assert canonical_countries() == ("IN", "US")
+    batch_id = "CHAOS-20261123-0100"
+    hour = datetime(2026, 11, 20, 2, 0, 0)
+    batch = Batch(
+        batch_id,
+        "chaos",
+        [
+            _row("keep-ok", hour),
+            _row("keep-ios", hour, platform="ios", country="US"),
+            _row("keep-web", hour, platform="web", country="US"),
+            _row("CHAOS-20261123-0100-m0", hour, platform="andriod", country="IND"),
+            _row("CHAOS-20261123-0100-m1", hour, platform="Android", country="IN"),
+            _row("CHAOS-20261123-0100-m2", hour, platform="android", country="USA"),
+        ],
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
+    warehouse = DuckDBWarehouse(tmp_path / "segments.duckdb")
+    try:
+        assert ingest_batch(warehouse, batch)["status"] == "success"
+        reasons = {
+            row["group_id"]: row["dq_reason"]
+            for row in warehouse.query(
+                "SELECT group_id, dq_status, dq_reason FROM silver_groups WHERE _batch_id = ?",
+                [batch_id],
+            )
+        }
+        assert reasons["keep-ok"] is None
+        assert reasons["keep-ios"] is None
+        assert reasons["keep-web"] is None
+        assert reasons["CHAOS-20261123-0100-m0"] == "invalid_platform"
+        assert reasons["CHAOS-20261123-0100-m1"] == "invalid_platform"
+        assert reasons["CHAOS-20261123-0100-m2"] == "invalid_country"
+        assert reconciliation_errors(warehouse, batch_id) == []
+
+        warehouse.execute(
+            """
+            UPDATE silver_groups
+            SET dq_status = 'ok', dq_reason = NULL
+            WHERE _batch_id = ? AND group_id LIKE '%-m_'
+            """,
+            [batch_id],
+        )
+        removed = remove_suspect(warehouse, batch_id, "engineering request")
+        assert removed["removed"] == 3
+        left = {row["group_id"] for row in warehouse.query("SELECT group_id FROM silver_groups WHERE _batch_id = ?", [batch_id])}
+        assert left == {"keep-ok", "keep-ios", "keep-web"}
+        assert _overlap(warehouse, batch_id) == 0
+        audit = warehouse.query(
+            """
+            SELECT rows_in, rows_out, rows_rejected, status
+            FROM pipeline_runs
+            WHERE batch_id = ? AND layer = 'remove_suspect'
+            """,
+            [batch_id],
+        )[0]
+        assert audit["status"] == "success"
+        assert int(audit["rows_in"]) == int(audit["rows_out"]) + int(audit["rows_rejected"])
+        assert int(audit["rows_in"]) == 3
+        assert reconciliation_errors(warehouse, batch_id) == []
+        second = remove_suspect(warehouse, batch_id, "engineering request")
+        assert second["removed"] == 0
+        assert left == {row["group_id"] for row in warehouse.query("SELECT group_id FROM silver_groups WHERE _batch_id = ?", [batch_id])}
+    finally:
+        warehouse.close()
+
+
+def test_row_key_backfill_matches_the_procedure_and_is_idempotent(tmp_path):
+    from signal_service.pipeline.row_keys import backfill_row_keys
+
+    warehouse = DuckDBWarehouse(tmp_path / "keys.duckdb")
+    try:
+        ensure_objects(warehouse)
+        loaded = datetime(2026, 11, 20, 2, 0, 0)
+        batch_id = "seed-2026-11-08"
+        warehouse.execute(
+            """
+            INSERT INTO silver_groups (
+                group_id, hour, platform, country, channel, payment_method, sku, app_version,
+                n_sessions, n_convert, n_attempt, _loaded_at, _batch_id, row_key
+            ) VALUES
+            (?, ?, 'android', 'IN', 'app', 'upi', 'SKU-100', '4.2.1', 10, 1, 2, ?, ?, NULL),
+            (?, ?, 'ios', 'US', 'app', 'card', 'SKU-100', '5.0.2', 8, 1, 1, ?, ?, 'preset-key')
+            """,
+            ["g-null", loaded, loaded, batch_id, "g-set", loaded, loaded, batch_id],
+        )
+        warehouse.execute(
+            """
+            INSERT INTO silver_support_tickets (
+                ticket_id, ts, platform, country, channel, payment_method, sku, app_version,
+                product_area, text_redacted, _loaded_at, _batch_id
+            ) VALUES (?, ?, 'android', 'IN', 'app', 'upi', 'SKU-100', '4.2.1', 'unspecified', 'UPI failed', ?, ?)
+            """,
+            ["t-1", loaded, loaded, batch_id],
+        )
+        warehouse.execute(
+            """
+            INSERT INTO silver_deploys (deploy_id, deployed_at, platform, app_version, note, _loaded_at, _batch_id)
+            VALUES ('d-1', ?, 'android', '4.2.1', 'rollout', ?, ?)
+            """,
+            [loaded, loaded, batch_id],
+        )
+        warehouse.execute(
+            """
+            INSERT INTO silver_demo_meta (key, value, _loaded_at, _batch_id)
+            VALUES ('aov_usd', '48', ?, ?)
+            """,
+            [loaded, batch_id],
+        )
+        warehouse.execute(
+            """
+            INSERT INTO silver_golden_tickets (
+                example_id, text_redacted, topic, sentiment, severity, product_area, _loaded_at, _batch_id
+            ) VALUES ('e-1', 'UPI failed', 'payment_failed', 'negative', 'high', 'payments', ?, ?)
+            """,
+            [loaded, batch_id],
+        )
+        warehouse.execute(
+            """
+            INSERT INTO silver_external_events (
+                event_id, case_id, title, summary, source_url, source_type, relevance,
+                observed_at, metric, provider, _loaded_at, _batch_id
+            ) VALUES ('ext-1', 'C-1', 'UPI', 'Banks', 'https://example.com/a', 'web', 0.9, ?, 'checkout_conversion', 'mock', ?, ?)
+            """,
+            [loaded, loaded, batch_id],
+        )
+        warehouse.execute(
+            """
+            INSERT INTO silver_spend (
+                logged_at, case_id, kind, estimated_usd, input_tokens, output_tokens, provider,
+                _loaded_at, _batch_id
+            ) VALUES (?, 'C-1', 'classify', 0, 0, 0, 'mock', ?, ?)
+            """,
+            [loaded, loaded, batch_id],
+        )
+        first = backfill_row_keys(warehouse)
+        assert first["updated"] == 7
+        expected = {
+            "silver_groups": procedure_row_key(
+                "bronze_groups",
+                batch_id,
+                warehouse.query("SELECT * FROM silver_groups WHERE group_id = 'g-null'")[0],
+            ),
+            "silver_support_tickets": procedure_row_key(
+                "bronze_support_tickets",
+                batch_id,
+                warehouse.query("SELECT * FROM silver_support_tickets")[0],
+            ),
+            "silver_deploys": procedure_row_key(
+                "bronze_deploys",
+                batch_id,
+                warehouse.query("SELECT * FROM silver_deploys")[0],
+            ),
+            "silver_demo_meta": procedure_row_key(
+                "bronze_demo_meta",
+                batch_id,
+                warehouse.query("SELECT * FROM silver_demo_meta WHERE key = 'aov_usd'")[0],
+            ),
+            "silver_golden_tickets": procedure_row_key(
+                "bronze_golden_tickets",
+                batch_id,
+                warehouse.query("SELECT * FROM silver_golden_tickets")[0],
+            ),
+            "silver_external_events": procedure_row_key(
+                "bronze_external_events",
+                batch_id,
+                warehouse.query("SELECT * FROM silver_external_events WHERE event_id = 'ext-1'")[0],
+            ),
+            "silver_spend": procedure_row_key(
+                "silver_spend",
+                batch_id,
+                warehouse.query("SELECT * FROM silver_spend WHERE case_id = 'C-1'")[0],
+            ),
+        }
+        stored = {
+            "silver_groups": warehouse.query("SELECT row_key FROM silver_groups WHERE group_id = 'g-null'")[0]["row_key"],
+            "silver_support_tickets": warehouse.query("SELECT row_key FROM silver_support_tickets")[0]["row_key"],
+            "silver_deploys": warehouse.query("SELECT row_key FROM silver_deploys WHERE deploy_id = 'd-1'")[0]["row_key"],
+            "silver_demo_meta": warehouse.query("SELECT row_key FROM silver_demo_meta WHERE key = 'aov_usd'")[0]["row_key"],
+            "silver_golden_tickets": warehouse.query("SELECT row_key FROM silver_golden_tickets WHERE example_id = 'e-1'")[0]["row_key"],
+            "silver_external_events": warehouse.query("SELECT row_key FROM silver_external_events WHERE event_id = 'ext-1'")[0]["row_key"],
+            "silver_spend": warehouse.query("SELECT row_key FROM silver_spend WHERE case_id = 'C-1'")[0]["row_key"],
+        }
+        assert stored == expected
+        assert all(value for value in stored.values())
+        group_row = warehouse.query("SELECT * FROM silver_groups WHERE group_id = 'g-null'")[0]
+        payload = row_key_payload("bronze_groups", batch_id, group_row)
+        digest = warehouse.query("SELECT sha256(?) AS digest", [payload])[0]["digest"]
+        assert digest == stored["silver_groups"]
+        assert warehouse.query("SELECT row_key FROM silver_groups WHERE group_id = 'g-set'")[0]["row_key"] == "preset-key"
+
+        second = backfill_row_keys(warehouse)
+        assert second["updated"] == 0
+        again = warehouse.query("SELECT group_id, row_key FROM silver_groups ORDER BY group_id")
+        assert {row["group_id"]: row["row_key"] for row in again} == {
+            "g-null": stored["silver_groups"],
+            "g-set": "preset-key",
+        }
+
+        load = medallion_statements("procedure")[0]
+        remove = medallion_statements("procedure")[2]
+        backfill_sql = "\n".join(medallion_statements("row_key_backfill"))
+        for source in (
+            "bronze_groups",
+            "bronze_support_tickets",
+            "bronze_deploys",
+            "bronze_demo_meta",
+            "bronze_golden_tickets",
+            "bronze_external_events",
+            "silver_spend",
+        ):
+            expr = row_key_sql(source)
+            assert expr in backfill_sql
+            assert expr in load or expr in remove
+        assert row_key_sql("bronze_groups") in load
+        assert row_key_sql("bronze_groups") in remove
+        assert "invalid_platform" in load and "invalid_platform" in remove
+        assert "invalid_country" in load and "invalid_country" in remove
     finally:
         warehouse.close()
 

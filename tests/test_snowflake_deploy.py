@@ -161,8 +161,45 @@ def _seed_scoped(upper: str) -> bool:
     return "SEED-2026-11-08" in upper and "_BATCH_ID" in upper
 
 
+_TASK_ROWS = [
+    [
+        "TASK_BRONZE_TO_SILVER",
+        "COMPUTE_WH",
+        None,
+        " OR ".join(
+            f"SYSTEM$STREAM_HAS_DATA('MCP_DB.SIGNAL_SANDBOX.{name}')"
+            for name in (
+                "STREAM_BRONZE_GROUPS",
+                "STREAM_BRONZE_SUPPORT_TICKETS",
+                "STREAM_BRONZE_DEPLOYS",
+                "STREAM_BRONZE_DEMO_META",
+                "STREAM_BRONZE_GOLDEN_TICKETS",
+                "STREAM_BRONZE_EXTERNAL_EVENTS",
+            )
+        ),
+        "CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(NULL)",
+        None,
+    ],
+    [
+        "TASK_SILVER_TO_GOLD",
+        "COMPUTE_WH",
+        None,
+        "SYSTEM$STREAM_HAS_DATA('MCP_DB.SIGNAL_SANDBOX.STREAM_SILVER_GROUPS')",
+        "CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(NULL)",
+        None,
+    ],
+]
+_TASK_COLUMNS = ["NAME", "WAREHOUSE", "SCHEDULE", "CONDITION", "DEFINITION", "TARGET_COMPLETION_INTERVAL"]
+
+
 def _answer_read(remote: _Remote, sql: str) -> tuple[list[str], list[list]]:
     upper = " ".join(sql.upper().split())
+    if upper.startswith("SHOW WAREHOUSES"):
+        return ["NAME"], [["COMPUTE_WH"]]
+    if upper.startswith("SHOW TASKS"):
+        return _TASK_COLUMNS, _TASK_ROWS
+    if upper.startswith("SHOW PARAMETERS"):
+        return ["KEY", "VALUE", "LEVEL"], []
     if "INFORMATION_SCHEMA.COLUMNS" in upper:
         return ["TABLE_NAME", "COLUMN_NAME"], [[table, column] for table, column in sorted(remote.columns)]
     if "PIPELINE_RUNS" in upper and "COUNT(" in upper:

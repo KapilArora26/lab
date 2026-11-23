@@ -145,13 +145,19 @@ def test_new_statement_types_are_sandbox_scoped():
     )
     assert_sandbox_write(
         f"CREATE OR REPLACE TASK {sandbox}.TASK_BRONZE_TO_SILVER "
-        "USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = 'XSMALL' "
+        "WAREHOUSE = COMPUTE_WH "
         "OVERLAP_POLICY = NO_OVERLAP "
-        "TARGET_COMPLETION_INTERVAL = '1 MINUTE' "
         f"WHEN SYSTEM$STREAM_HAS_DATA('{sandbox}.STREAM_BRONZE_GROUPS') "
         f"AS CALL {sandbox}.LOAD_STAGING(NULL)"
     )
     assert_sandbox_write(f"ALTER TASK {sandbox}.TASK_BRONZE_TO_SILVER RESUME")
+    assert_sandbox_write(f"ALTER TASK {sandbox}.TASK_BRONZE_TO_SILVER SUSPEND")
+    assert_sandbox_write(f"ALTER TASK {sandbox}.TASK_SILVER_TO_GOLD SUSPEND")
+    assert_sandbox_write(f"ALTER TASK {sandbox}.TASK_BRONZE_TO_SILVER SET WAREHOUSE = COMPUTE_WH")
+    assert_sandbox_write(
+        f"ALTER TASK {sandbox}.TASK_SILVER_TO_GOLD UNSET TARGET_COMPLETION_INTERVAL, USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE"
+    )
+    assert_sandbox_write(f"ALTER TASK {sandbox}.TASK_SILVER_TO_GOLD UNSET USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE")
     assert_sandbox_write(f"CALL {sandbox}.LOAD_STAGING('seed-20261108-20261120')")
     assert_sandbox_write(f"CALL {sandbox}.RERUN_STAGING('seed-20261108-20261120')")
     assert_sandbox_write(
@@ -175,7 +181,17 @@ def test_new_statement_types_are_sandbox_scoped():
     with pytest.raises(UnsafeSQL):
         assert_sandbox_write(f"ALTER TABLE {sandbox}.SILVER_GROUPS DROP COLUMN dq_status")
     with pytest.raises(UnsafeSQL):
-        assert_sandbox_write(f"ALTER TASK {sandbox}.TASK_BRONZE_TO_SILVER SUSPEND")
+        assert_sandbox_write(f"ALTER TASK {sandbox}.TASK_OTHER SUSPEND")
+    with pytest.raises(UnsafeSQL):
+        assert_sandbox_write(f"ALTER TASK {sandbox}.TASK_BRONZE_TO_SILVER SET WAREHOUSE = OTHER_WH")
+    with pytest.raises(UnsafeSQL):
+        assert_sandbox_write(f"ALTER TASK {sandbox}.TASK_BRONZE_TO_SILVER UNSET WAREHOUSE")
+    with pytest.raises(UnsafeSQL):
+        assert_sandbox_write("CREATE WAREHOUSE COMPUTE_WH")
+    with pytest.raises(UnsafeSQL):
+        assert_sandbox_write("ALTER WAREHOUSE COMPUTE_WH SET WAREHOUSE_SIZE = XSMALL")
+    with pytest.raises(UnsafeSQL):
+        assert_sandbox_write(f"GRANT USAGE ON WAREHOUSE COMPUTE_WH TO ROLE {sandbox}.LOADER")
     with pytest.raises(UnsafeSQL):
         assert_sandbox_write("CALL OTHER_DB.SIGNAL_SANDBOX.LOAD_STAGING('x')")
     with pytest.raises(UnsafeSQL):

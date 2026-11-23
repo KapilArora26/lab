@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from signal_service.hashing import bronze_row_key, timestamp_reason
+from signal_service.pipeline.segments import segment_dq_reason
 from signal_service.safety.redaction import pii_kinds
 
 
@@ -138,6 +139,9 @@ def group_reason(row: dict, seen: set[str]) -> str | None:
         return "conversions_gt_attempts"
     if not row.get("platform") or not row.get("country"):
         return "null segment"
+    segment = segment_dq_reason(row.get("platform"), row.get("country"))
+    if segment:
+        return segment
     stamped = timestamp_reason(row.get("hour"))
     if stamped:
         return stamped
@@ -157,7 +161,7 @@ def ticket_reason(row: dict, seen: set[str]) -> str | None:
     kinds = pii_kinds(str(text))
     if kinds:
         return "pii:" + ",".join(kinds)
-    return None
+    return segment_dq_reason(row.get("platform"), row.get("country"))
 
 
 def _simple_reason(row: dict, key: str, seen: set[str], label: str) -> str | None:

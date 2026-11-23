@@ -13,6 +13,7 @@ that key. A second call finds nothing left to delete.
 from __future__ import annotations
 
 from signal_service.hashing import bronze_row_key, timestamp_reason
+from signal_service.pipeline.segments import segment_dq_reason
 from signal_service.pipeline.propagate import clock, load_gold, write_run
 
 _TARGETS = (
@@ -38,6 +39,7 @@ def remove_suspect(warehouse, batch_id: str, reason: str | None = None) -> dict:
     if len(note) > 200:
         note = note[:200]
     _flag_timestamps(warehouse, batch_id)
+    _flag_segments(warehouse, batch_id)
     removed_at = clock()
     removed = 0
     for table, source, _key in _TARGETS:
@@ -180,6 +182,64 @@ def _flag_timestamps(warehouse, batch_id: str) -> None:
               AND COALESCE(dq_status, 'ok') <> 'suspect'
             """,
             [reason, batch_id, row.get("logged_at"), row.get("case_id"), row.get("kind")],
+        )
+
+
+def _flag_segments(warehouse, batch_id: str) -> None:
+    """Mark platform or country values outside the canonical set.
+
+    An older load can leave those rows ``ok``. Removal applies the same check
+    ``LOAD_STAGING`` uses, then archives whatever is suspect.
+    """
+    _flag_segment_table(
+        warehouse,
+        batch_id,
+        "silver_groups",
+        """
+        UPDATE silver_groups
+        SET dq_status = 'suspect', dq_reason = ?
+        WHERE _batch_id = ?
+          AND group_id IS NOT DISTINCT FROM ?
+          AND platform IS NOT DISTINCT FROM ?
+          AND country IS NOT DISTINCT FROM ?
+          AND COALESCE(dq_status, 'ok') <> 'suspect'
+        """,
+    )
+    _flag_segment_table(
+        warehouse,
+        batch_id,
+        "silver_support_tickets",
+        """
+        UPDATE silver_support_tickets
+        SET dq_status = 'suspect', dq_reason = ?
+        WHERE _batch_id = ?
+          AND ticket_id IS NOT DISTINCT FROM ?
+          AND platform IS NOT DISTINCT FROM ?
+          AND country IS NOT DISTINCT FROM ?
+          AND COALESCE(dq_status, 'ok') <> 'suspect'
+        """,
+        identity="ticket_id",
+    )
+
+
+def _flag_segment_table(
+    warehouse,
+    batch_id: str,
+    table: str,
+    sql: str,
+    identity: str = "group_id",
+) -> None:
+    try:
+        rows = warehouse.query(f"SELECT * FROM {table} WHERE _batch_id = ?", [batch_id])
+    except Exception:
+        return
+    for row in rows:
+        reason = segment_dq_reason(row.get("platform"), row.get("country"))
+        if not reason or row.get("dq_status") == "suspect":
+            continue
+        warehouse.execute(
+            sql,
+            [reason, batch_id, row.get(identity), row.get("platform"), row.get("country")],
         )
 
 

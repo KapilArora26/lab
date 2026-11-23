@@ -15,7 +15,15 @@ from fastapi.testclient import TestClient
 from signal_service.api.app import create_app
 from signal_service.pipeline.ddl import medallion_statements
 from signal_service.pipeline.ingest import SEED_BATCH_ID, Batch, ingest, ingest_batch, ingest_seed, rerun_batch
-from signal_service.pipeline.mode import ModeReport, ProcedureCompileError, dynamic_table_sql, install_event_driven
+from signal_service.pipeline.mode import (
+    ModeReport,
+    ProcedureCompileError,
+    WarehouseUsageError,
+    align_user_managed_tasks,
+    dynamic_table_sql,
+    install_event_driven,
+    task_shape_errors,
+)
 from signal_service.pipeline.reconcile import reconciliation_errors
 from signal_service.safety.redaction import pii_kinds
 from signal_service.warehouse.duckdb import DuckDBWarehouse
@@ -738,11 +746,11 @@ def test_triggered_task_ddl_has_no_schedule_and_keeps_stream_conditions():
     for statement in tasks:
         folded = " ".join(statement.upper().split())
         assert "SCHEDULE" not in folded
-        assert re.search(r"\bWAREHOUSE\s*=", folded) is None
-        assert "USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = 'XSMALL'" in folded
+        assert "WAREHOUSE = COMPUTE_WH" in folded
+        assert "USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE" not in folded
         assert "OVERLAP_POLICY = NO_OVERLAP" in folded
         assert "ALLOW_OVERLAPPING_EXECUTION = TRUE" not in folded
-        assert "TARGET_COMPLETION_INTERVAL = '1 MINUTE'" in folded
+        assert "TARGET_COMPLETION_INTERVAL" not in folded
         assert "USER_TASK_MINIMUM_TRIGGER_INTERVAL_IN_SECONDS" not in folded
         assert "WHEN" in folded
         assert "CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(NULL)" in folded
@@ -778,6 +786,147 @@ def test_triggered_task_ddl_has_no_schedule_and_keeps_stream_conditions():
         assert f"CREATE TABLE IF NOT EXISTS MCP_DB.SIGNAL_SANDBOX.{source}" in core
 
 
+_BRONZE_CONDITION = " OR ".join(
+    f"SYSTEM$STREAM_HAS_DATA('MCP_DB.SIGNAL_SANDBOX.{name}')" for name in _BRONZE_TRIGGER_STREAMS
+)
+_SILVER_CONDITION = "SYSTEM$STREAM_HAS_DATA('MCP_DB.SIGNAL_SANDBOX.STREAM_SILVER_GROUPS')"
+_TASK_DEFINITION = "CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(NULL)"
+
+
+class _TaskWarehouse:
+    """In-memory stand-in for the Snowflake adapter. It does not open a connection."""
+
+    backend = "snowflake"
+
+    def __init__(self, *, warehouses=None, tasks=None, parameters=None):
+        self.warehouses = ["COMPUTE_WH"] if warehouses is None else list(warehouses)
+        self.tasks = {} if tasks is None else {name: dict(row) for name, row in tasks.items()}
+        self.parameters = {} if parameters is None else {name: set(values) for name, values in parameters.items()}
+        self.executed: list[str] = []
+
+    def query(self, sql, params=None):
+        upper = " ".join(sql.upper().split())
+        if upper.startswith("SHOW WAREHOUSES"):
+            return [{"name": name} for name in self.warehouses]
+        if upper.startswith("SHOW TASKS"):
+            return [dict(row) for row in self.tasks.values()]
+        if upper.startswith("SHOW PARAMETERS IN TASK"):
+            name = upper.rsplit(".", 1)[-1]
+            rows = []
+            for key in sorted(self.parameters.get(name, ())):
+                rows.append({"key": key, "value": "XSMALL" if "SIZE" in key else "1 MINUTE", "level": "TASK"})
+            return rows
+        raise AssertionError(upper)
+
+    def execute(self, sql, params=None):
+        from signal_service.warehouse.snowflake import assert_sandbox_write
+
+        assert_sandbox_write(sql)
+        upper = " ".join(sql.upper().split())
+        self.executed.append(upper)
+        if "CREATE WAREHOUSE" in upper or "ALTER WAREHOUSE" in upper or upper.startswith("GRANT"):
+            raise AssertionError(upper)
+        if not upper.startswith("ALTER TASK"):
+            if upper.startswith("CREATE OR REPLACE TASK"):
+                name = "TASK_BRONZE_TO_SILVER" if "TASK_BRONZE_TO_SILVER" in upper else "TASK_SILVER_TO_GOLD"
+                condition = _BRONZE_CONDITION if name == "TASK_BRONZE_TO_SILVER" else _SILVER_CONDITION
+                self.tasks[name] = {
+                    "name": name,
+                    "warehouse": "COMPUTE_WH",
+                    "schedule": None,
+                    "condition": condition,
+                    "definition": _TASK_DEFINITION,
+                    "target_completion_interval": None,
+                }
+                self.parameters[name] = set()
+            return
+        name = "TASK_BRONZE_TO_SILVER" if "TASK_BRONZE_TO_SILVER" in upper else "TASK_SILVER_TO_GOLD"
+        if upper.endswith("SUSPEND") or upper.endswith("RESUME"):
+            return
+        if "SET WAREHOUSE = COMPUTE_WH" in upper:
+            self.tasks[name]["warehouse"] = "COMPUTE_WH"
+            return
+        if " UNSET " in upper:
+            for key in ("USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE", "TARGET_COMPLETION_INTERVAL"):
+                if key in upper:
+                    self.parameters.setdefault(name, set()).discard(key)
+            if "TARGET_COMPLETION_INTERVAL" in upper and name in self.tasks:
+                self.tasks[name]["target_completion_interval"] = None
+
+
+def _serverless_tasks():
+    tasks = {}
+    parameters = {}
+    for name, condition in (
+        ("TASK_BRONZE_TO_SILVER", _BRONZE_CONDITION),
+        ("TASK_SILVER_TO_GOLD", _SILVER_CONDITION),
+    ):
+        tasks[name] = {
+            "name": name,
+            "warehouse": None,
+            "schedule": None,
+            "condition": condition,
+            "definition": _TASK_DEFINITION,
+            "target_completion_interval": "1 MINUTE",
+        }
+        parameters[name] = {"USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE", "TARGET_COMPLETION_INTERVAL"}
+    return tasks, parameters
+
+
+def test_existing_tasks_move_to_compute_wh_and_show_tasks_matches():
+    tasks, parameters = _serverless_tasks()
+    warehouse = _TaskWarehouse(tasks=tasks, parameters=parameters)
+    align_user_managed_tasks(warehouse)
+    errors = task_shape_errors(list(warehouse.tasks.values()))
+    assert errors == []
+    executed = warehouse.executed
+    bronze_suspend = executed.index("ALTER TASK MCP_DB.SIGNAL_SANDBOX.TASK_BRONZE_TO_SILVER SUSPEND")
+    silver_suspend = executed.index("ALTER TASK MCP_DB.SIGNAL_SANDBOX.TASK_SILVER_TO_GOLD SUSPEND")
+    assert bronze_suspend < silver_suspend
+    for name in ("TASK_BRONZE_TO_SILVER", "TASK_SILVER_TO_GOLD"):
+        prefix = f"ALTER TASK MCP_DB.SIGNAL_SANDBOX.{name}"
+        unset_size = executed.index(f"{prefix} UNSET USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE")
+        set_warehouse = executed.index(f"{prefix} SET WAREHOUSE = COMPUTE_WH")
+        unset_interval = executed.index(f"{prefix} UNSET TARGET_COMPLETION_INTERVAL")
+        assert unset_size < set_warehouse < unset_interval
+    silver_resume = executed.index("ALTER TASK MCP_DB.SIGNAL_SANDBOX.TASK_SILVER_TO_GOLD RESUME")
+    bronze_resume = executed.index("ALTER TASK MCP_DB.SIGNAL_SANDBOX.TASK_BRONZE_TO_SILVER RESUME")
+    assert silver_resume < bronze_resume
+    assert not any("CREATE WAREHOUSE" in sql or "ALTER WAREHOUSE" in sql or sql.startswith("GRANT") for sql in executed)
+
+    again = list(warehouse.executed)
+    align_user_managed_tasks(warehouse)
+    second = warehouse.executed[len(again) :]
+    assert not any(" UNSET " in sql for sql in second)
+    assert any("SET WAREHOUSE = COMPUTE_WH" in sql for sql in second)
+    assert task_shape_errors(list(warehouse.tasks.values())) == []
+
+
+def test_missing_compute_wh_usage_fails_before_any_warehouse_change():
+    warehouse = _TaskWarehouse(warehouses=[])
+    with pytest.raises(WarehouseUsageError, match="lacks USAGE on warehouse COMPUTE_WH"):
+        align_user_managed_tasks(warehouse)
+    assert warehouse.executed == []
+
+
+def test_task_warehouse_privilege_error_fails_install():
+    class Scripted:
+        backend = "snowflake"
+
+        def query(self, sql, params=None):
+            upper = " ".join(sql.upper().split())
+            if upper.startswith("SHOW WAREHOUSES"):
+                return [{"name": "COMPUTE_WH"}]
+            return []
+
+        def execute(self, sql, params=None):
+            if "CREATE OR REPLACE TASK" in " ".join(sql.upper().split()):
+                raise RuntimeError("Insufficient privileges to operate on warehouse 'COMPUTE_WH'.")
+
+    with pytest.raises(WarehouseUsageError, match="lacks USAGE on warehouse COMPUTE_WH"):
+        install_event_driven(Scripted())
+
+
 def test_task_ddl_is_a_single_load_staging_call():
     tasks = medallion_statements("task")
     assert len(tasks) == 2
@@ -799,6 +948,9 @@ def test_task_ddl_is_a_single_load_staging_call():
     assert "GOLD_TICKET_TOPICS" in load_staging.upper()
     assert "BRONZE_EXTERNAL_EVENTS" in load_staging.upper()
     assert "SILVER_EXTERNAL_EVENTS" in load_staging.upper()
+    assert "INSERT INTO MCP_DB.SIGNAL_SANDBOX.GOLD_HOURLY_CONVERSION" in load_staging.upper()
+    assert "INSERT INTO MCP_DB.SIGNAL_SANDBOX.GOLD_REVENUE_AT_RISK" in load_staging.upper()
+    assert "INSERT INTO MCP_DB.SIGNAL_SANDBOX.GOLD_DAILY_SPEND" in load_staging.upper()
 
 
 def test_migrations_keep_one_load_staging_signature_and_never_drop():
