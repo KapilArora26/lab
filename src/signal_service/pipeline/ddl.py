@@ -659,7 +659,9 @@ def duckdb_statements() -> list[str]:
 
 
 def medallion_statements(section: str | None = None) -> list[str]:
-    raw = sql_path("snowflake", "002_medallion.sql").read_text(encoding="utf-8")
+    from signal_service.pipeline.row_keys import render_medallion_sql
+
+    raw = render_medallion_sql(sql_path("snowflake", "002_medallion.sql").read_text(encoding="utf-8"))
     pairs = split_sql(raw)
     if section is None:
         return [statement for _, statement in pairs]
@@ -685,5 +687,7 @@ def ensure_objects(warehouse) -> None:
         for statement in duckdb_statements():
             warehouse.execute(statement)
     from signal_service.pipeline.external_backfill import promote_legacy_external_events
+    from signal_service.pipeline.row_keys import backfill_row_keys
 
     promote_legacy_external_events(warehouse)
+    backfill_row_keys(warehouse)

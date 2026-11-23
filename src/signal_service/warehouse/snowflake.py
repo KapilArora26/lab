@@ -4,7 +4,9 @@ Talks to a Snowflake-managed MCP server over JSON-RPC. The token is read from
 SNOWFLAKE_PAT_TOKEN. SNOWFLAKE_PAT is used only when SNOWFLAKE_PAT_TOKEN is
 unset. Writes are limited to MCP_DB.SIGNAL_SANDBOX. Additive ADD COLUMN
 statements are skipped when INFORMATION_SCHEMA.COLUMNS already lists the
-column. This module does not open a connection at import time and does nothing
+column. CREATE WAREHOUSE, ALTER WAREHOUSE, and GRANT are refused. The two
+pipeline tasks may be suspended, pointed at COMPUTE_WH, and cleared of the
+serverless task parameters. This module does not open a connection at import time and does nothing
 when the token is absent.
 """
 
@@ -341,6 +343,8 @@ def assert_sandbox_write(sql: str, sandbox: str = SANDBOX_QUALIFIED) -> str:
         if upper != expected:
             raise UnsafeSQL(f"only {expected} is allowed")
         return text
+    if re.match(r"(?is)^(create|alter)\s+warehouse\b", text):
+        raise UnsafeSQL("CREATE WAREHOUSE and ALTER WAREHOUSE are refused")
     if upper_sandbox not in upper:
         raise UnsafeSQL(f"writes must be fully qualified to {sandbox}")
     _assert_created_object_qualified(text, sandbox)
@@ -368,15 +372,34 @@ def _assert_alter_or_call(text: str, sandbox: str) -> None:
     collapsed = " ".join(text.split())
     if re.match(r"(?is)^alter\b", collapsed):
         task = rf"(?is)^alter\s+task\s+{re.escape(sandbox)}\.[A-Za-z_][A-Za-z0-9_]*\s+resume$"
+        managed = rf"(?:{re.escape(sandbox)}\.(?:TASK_BRONZE_TO_SILVER|TASK_SILVER_TO_GOLD))"
+        suspend = rf"(?is)^alter\s+task\s+{managed}\s+suspend$"
+        set_warehouse = rf"(?is)^alter\s+task\s+{managed}\s+set\s+warehouse\s*=\s*compute_wh$"
+        unset = (
+            rf"(?is)^alter\s+task\s+{managed}\s+unset\s+"
+            r"(?:target_completion_interval|user_task_managed_initial_warehouse_size)"
+            r"(?:\s*,\s*(?:target_completion_interval|user_task_managed_initial_warehouse_size))?$"
+        )
         column = (
             rf"(?is)^alter\s+table\s+{re.escape(sandbox)}\.[A-Za-z_][A-Za-z0-9_]*\s+"
             r"add\s+column\s+(?:if\s+not\s+exists\s+)?[A-Za-z_][A-Za-z0-9_]*\s+"
             r"[A-Za-z_][A-Za-z0-9_]*"
             r"(?:\s+default\s+(?:'[^']*'|-?\d+))?\s*$"
         )
-        if not re.match(task, collapsed) and not re.match(column, collapsed):
+        allowed = (
+            re.match(task, collapsed)
+            or re.match(suspend, collapsed)
+            or re.match(set_warehouse, collapsed)
+            or re.match(unset, collapsed)
+            or re.match(column, collapsed)
+        )
+        if not allowed:
             raise UnsafeSQL(
-                f"only ALTER TASK {sandbox}.<task> RESUME or ALTER TABLE {sandbox}.<table> ADD COLUMN is allowed"
+                f"only ALTER TASK {sandbox}.<task> RESUME, "
+                f"ALTER TASK {sandbox}.TASK_BRONZE_TO_SILVER or TASK_SILVER_TO_GOLD "
+                "SUSPEND, SET WAREHOUSE = COMPUTE_WH, or UNSET "
+                "TARGET_COMPLETION_INTERVAL and USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE, "
+                f"or ALTER TABLE {sandbox}.<table> ADD COLUMN is allowed"
             )
     if re.match(r"(?is)^call\b", collapsed):
         pattern = rf"(?is)^call\s+{re.escape(sandbox)}\.(?:LOAD_STAGING|RERUN_STAGING|REMOVE_SUSPECT)\s*\("

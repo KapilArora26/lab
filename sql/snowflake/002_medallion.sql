@@ -3,14 +3,14 @@
 --
 -- ALTER TABLE ... ADD COLUMN is additive. ALTER TASK ... RESUME is how a new
 -- task starts, because tasks are created suspended. There is no DROP,
--- TRUNCATE, or GRANT. TASK_BRONZE_TO_SILVER and TASK_SILVER_TO_GOLD are
--- serverless triggered tasks: no SCHEDULE and no WAREHOUSE. Each WHEN clause
--- is SYSTEM$STREAM_HAS_DATA on table streams, so the task runs when those
--- streams get rows. TARGET_COMPLETION_INTERVAL is required for a serverless
--- triggered task. OVERLAP_POLICY = NO_OVERLAP is ALLOW_OVERLAPPING_EXECUTION
--- = FALSE. The minimum trigger interval stays at the Snowflake default
--- (30 seconds). This file does not set an account parameter. Each task body
--- is one statement:
+-- TRUNCATE, or GRANT, and this file does not create or alter a warehouse.
+-- TASK_BRONZE_TO_SILVER and TASK_SILVER_TO_GOLD are user-managed triggered
+-- tasks: no SCHEDULE, WAREHOUSE = COMPUTE_WH, and no serverless parameters.
+-- Each WHEN clause is SYSTEM$STREAM_HAS_DATA on table streams, so the task
+-- runs when those streams get rows. OVERLAP_POLICY = NO_OVERLAP is
+-- ALLOW_OVERLAPPING_EXECUTION = FALSE. The minimum trigger interval stays at
+-- the Snowflake default (30 seconds). This file does not set an account
+-- parameter. Each task body is one statement:
 -- CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(NULL). A null batch reads every
 -- stream with DML inside one transaction so the offset advances on commit,
 -- then loads only batch ids that do not already have a gold success. It does
@@ -676,7 +676,8 @@ USING (
     SELECT
         event_id, case_id, title, summary, source_url, source_type, relevance,
         observed_at, metric, provider, _batch_id,
-        CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ AS _loaded_at
+        CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ AS _loaded_at,
+        @@ROWKEY bronze_external_events@@ AS row_key
     FROM MCP_DB.SIGNAL_SANDBOX.BRONZE_EXTERNAL_EVENTS
     WHERE _source = 'external_events'
       AND event_id IS NOT NULL
@@ -684,11 +685,45 @@ USING (
 ON t.event_id = s.event_id
 WHEN NOT MATCHED THEN INSERT (
     event_id, case_id, title, summary, source_url, source_type, relevance,
-    observed_at, metric, provider, _loaded_at, _batch_id
+    observed_at, metric, provider, _loaded_at, _batch_id, row_key
 ) VALUES (
     s.event_id, s.case_id, s.title, s.summary, s.source_url, s.source_type, s.relevance,
-    s.observed_at, s.metric, s.provider, s._loaded_at, s._batch_id
+    s.observed_at, s.metric, s.provider, s._loaded_at, s._batch_id, s.row_key
 );
+
+-- @section row_key_backfill
+
+-- Fill row_key only where it is null. A second run matches no rows.
+-- The expression is the same SHA2 LOAD_STAGING and REMOVE_SUSPECT use.
+-- SILVER_REJECTS is the archive: its key is copied from the source row.
+
+UPDATE MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS
+SET row_key = @@ROWKEY bronze_groups@@
+WHERE row_key IS NULL;
+
+UPDATE MCP_DB.SIGNAL_SANDBOX.SILVER_SUPPORT_TICKETS
+SET row_key = @@ROWKEY bronze_support_tickets@@
+WHERE row_key IS NULL;
+
+UPDATE MCP_DB.SIGNAL_SANDBOX.SILVER_DEPLOYS
+SET row_key = @@ROWKEY bronze_deploys@@
+WHERE row_key IS NULL;
+
+UPDATE MCP_DB.SIGNAL_SANDBOX.SILVER_DEMO_META
+SET row_key = @@ROWKEY bronze_demo_meta@@
+WHERE row_key IS NULL;
+
+UPDATE MCP_DB.SIGNAL_SANDBOX.SILVER_GOLDEN_TICKETS
+SET row_key = @@ROWKEY bronze_golden_tickets@@
+WHERE row_key IS NULL;
+
+UPDATE MCP_DB.SIGNAL_SANDBOX.SILVER_EXTERNAL_EVENTS
+SET row_key = @@ROWKEY bronze_external_events@@
+WHERE row_key IS NULL;
+
+UPDATE MCP_DB.SIGNAL_SANDBOX.SILVER_SPEND
+SET row_key = @@ROWKEY silver_spend@@
+WHERE row_key IS NULL;
 
 -- @section stream
 
@@ -919,21 +954,7 @@ BEGIN
         SELECT
             group_id, hour, platform, country, channel, payment_method, sku, app_version,
             n_sessions, n_convert, n_attempt, _batch_id,
-            SHA2(
-                'bronze_groups' || CHR(31) || COALESCE(_batch_id, '') || CHR(31) ||
-                IFF(group_id IS NULL, '0', '1' || group_id) || CHR(31) ||
-                IFF(hour IS NULL, '0', '1' || TO_VARCHAR(hour, 'YYYY-MM-DD HH24:MI:SS')) || CHR(31) ||
-                IFF(platform IS NULL, '0', '1' || platform) || CHR(31) ||
-                IFF(country IS NULL, '0', '1' || country) || CHR(31) ||
-                IFF(channel IS NULL, '0', '1' || channel) || CHR(31) ||
-                IFF(payment_method IS NULL, '0', '1' || payment_method) || CHR(31) ||
-                IFF(sku IS NULL, '0', '1' || sku) || CHR(31) ||
-                IFF(app_version IS NULL, '0', '1' || app_version) || CHR(31) ||
-                IFF(n_sessions IS NULL, '0', '1' || TO_VARCHAR(n_sessions)) || CHR(31) ||
-                IFF(n_convert IS NULL, '0', '1' || TO_VARCHAR(n_convert)) || CHR(31) ||
-                IFF(n_attempt IS NULL, '0', '1' || TO_VARCHAR(n_attempt)),
-                256
-            ) AS row_key,
+            @@ROWKEY bronze_groups@@ AS row_key,
             CASE
                 WHEN group_id IS NULL THEN 'null group_id'
                 WHEN hour IS NULL THEN 'null hour'
@@ -941,7 +962,9 @@ BEGIN
                 WHEN n_sessions < 0 OR n_convert < 0 OR n_attempt < 0 THEN 'negative_count'
                 WHEN n_convert > n_sessions THEN 'conversions_gt_sessions'
                 WHEN n_convert > n_attempt THEN 'conversions_gt_attempts'
-                WHEN platform IS NULL OR country IS NULL THEN 'null segment'
+                WHEN platform IS NULL OR country IS NULL OR platform = '' OR country = '' THEN 'null segment'
+                WHEN platform NOT IN (@@ALLOWED_PLATFORMS@@) THEN 'invalid_platform'
+                WHEN country NOT IN (@@ALLOWED_COUNTRIES@@) THEN 'invalid_country'
                 WHEN YEAR(hour) = 1970 THEN 'epoch_timestamp'
                 WHEN hour < :v_floor THEN 'timestamp_before_floor'
                 WHEN hour > DATEADD('second', :v_grace, :v_loaded) THEN 'future_timestamp'
@@ -991,7 +1014,22 @@ BEGIN
     MERGE INTO MCP_DB.SIGNAL_SANDBOX.SILVER_SUPPORT_TICKETS t
     USING (
         SELECT ticket_id, ts, platform, country, channel, payment_method, sku, app_version,
-               product_area, text_redacted, _batch_id
+               product_area, text_redacted, _batch_id,
+               @@ROWKEY bronze_support_tickets src@@ AS row_key,
+               CASE
+                   WHEN src.platform IS NOT NULL AND src.platform <> ''
+                        AND src.platform NOT IN (@@ALLOWED_PLATFORMS@@) THEN 'suspect'
+                   WHEN src.country IS NOT NULL AND src.country <> ''
+                        AND src.country NOT IN (@@ALLOWED_COUNTRIES@@) THEN 'suspect'
+                   ELSE 'ok'
+               END AS dq_status,
+               CASE
+                   WHEN src.platform IS NOT NULL AND src.platform <> ''
+                        AND src.platform NOT IN (@@ALLOWED_PLATFORMS@@) THEN 'invalid_platform'
+                   WHEN src.country IS NOT NULL AND src.country <> ''
+                        AND src.country NOT IN (@@ALLOWED_COUNTRIES@@) THEN 'invalid_country'
+                   ELSE NULL
+               END AS dq_reason
         FROM MCP_DB.SIGNAL_SANDBOX.BRONZE_SUPPORT_TICKETS src
         WHERE src._batch_id IN (SELECT batch_id FROM MCP_DB.SIGNAL_SANDBOX.STREAM_BATCH_QUEUE)
           AND src.ticket_id IS NOT NULL
@@ -1010,13 +1048,7 @@ BEGIN
                     EQUAL_NULL(removed.row_key, src.ticket_id)
                     OR EQUAL_NULL(
                         removed.row_key,
-                        SHA2(
-                            'bronze_support_tickets' || CHR(31) || COALESCE(src._batch_id, '') || CHR(31) ||
-                            IFF(src.ticket_id IS NULL, '0', '1' || src.ticket_id) || CHR(31) ||
-                            IFF(src.ts IS NULL, '0', '1' || TO_VARCHAR(src.ts, 'YYYY-MM-DD HH24:MI:SS')) || CHR(31) ||
-                            IFF(src.text_redacted IS NULL, '0', '1' || src.text_redacted),
-                            256
-                        )
+                        @@ROWKEY bronze_support_tickets src@@
                     )
                 )
           )
@@ -1024,15 +1056,16 @@ BEGIN
     ON EQUAL_NULL(t.ticket_id, s.ticket_id)
     WHEN NOT MATCHED THEN INSERT (
         ticket_id, ts, platform, country, channel, payment_method, sku, app_version,
-        product_area, text_redacted, _loaded_at, _batch_id
+        product_area, text_redacted, _loaded_at, _batch_id, row_key, dq_status, dq_reason
     ) VALUES (
         s.ticket_id, s.ts, s.platform, s.country, s.channel, s.payment_method, s.sku, s.app_version,
-        s.product_area, s.text_redacted, :v_loaded, s._batch_id
+        s.product_area, s.text_redacted, :v_loaded, s._batch_id, s.row_key, s.dq_status, s.dq_reason
     );
 
     MERGE INTO MCP_DB.SIGNAL_SANDBOX.SILVER_DEPLOYS t
     USING (
-        SELECT deploy_id, deployed_at, platform, app_version, note, _batch_id
+        SELECT deploy_id, deployed_at, platform, app_version, note, _batch_id,
+               @@ROWKEY bronze_deploys@@ AS row_key
         FROM MCP_DB.SIGNAL_SANDBOX.BRONZE_DEPLOYS src
         WHERE src._batch_id IN (SELECT batch_id FROM MCP_DB.SIGNAL_SANDBOX.STREAM_BATCH_QUEUE)
           AND src.deploy_id IS NOT NULL
@@ -1046,21 +1079,22 @@ BEGIN
                     EQUAL_NULL(removed.row_key, deploy_id)
                     OR EQUAL_NULL(
                         removed.row_key,
-                        SHA2('bronze_deploys' || CHR(31) || COALESCE(_batch_id, '') || CHR(31) || IFF(deploy_id IS NULL, '0', '1' || deploy_id), 256)
+                        @@ROWKEY bronze_deploys@@
                     )
                 )
           )
     ) s
     ON EQUAL_NULL(t.deploy_id, s.deploy_id)
     WHEN NOT MATCHED THEN INSERT (
-        deploy_id, deployed_at, platform, app_version, note, _loaded_at, _batch_id
+        deploy_id, deployed_at, platform, app_version, note, _loaded_at, _batch_id, row_key
     ) VALUES (
-        s.deploy_id, s.deployed_at, s.platform, s.app_version, s.note, :v_loaded, s._batch_id
+        s.deploy_id, s.deployed_at, s.platform, s.app_version, s.note, :v_loaded, s._batch_id, s.row_key
     );
 
     MERGE INTO MCP_DB.SIGNAL_SANDBOX.SILVER_DEMO_META t
     USING (
-        SELECT key, value, _batch_id
+        SELECT key, value, _batch_id,
+               @@ROWKEY bronze_demo_meta@@ AS row_key
         FROM MCP_DB.SIGNAL_SANDBOX.BRONZE_DEMO_META src
         WHERE src._batch_id IN (SELECT batch_id FROM MCP_DB.SIGNAL_SANDBOX.STREAM_BATCH_QUEUE)
           AND src.key IS NOT NULL
@@ -1074,18 +1108,19 @@ BEGIN
                     EQUAL_NULL(removed.row_key, key)
                     OR EQUAL_NULL(
                         removed.row_key,
-                        SHA2('bronze_demo_meta' || CHR(31) || COALESCE(_batch_id, '') || CHR(31) || IFF(key IS NULL, '0', '1' || key) || CHR(31) || IFF(value IS NULL, '0', '1' || value), 256)
+                        @@ROWKEY bronze_demo_meta@@
                     )
                 )
           )
     ) s
     ON EQUAL_NULL(t.key, s.key)
-    WHEN NOT MATCHED THEN INSERT (key, value, _loaded_at, _batch_id)
-    VALUES (s.key, s.value, :v_loaded, s._batch_id);
+    WHEN NOT MATCHED THEN INSERT (key, value, _loaded_at, _batch_id, row_key)
+    VALUES (s.key, s.value, :v_loaded, s._batch_id, s.row_key);
 
     MERGE INTO MCP_DB.SIGNAL_SANDBOX.SILVER_GOLDEN_TICKETS t
     USING (
-        SELECT example_id, text_redacted, topic, sentiment, severity, product_area, _batch_id
+        SELECT example_id, text_redacted, topic, sentiment, severity, product_area, _batch_id,
+               @@ROWKEY bronze_golden_tickets@@ AS row_key
         FROM MCP_DB.SIGNAL_SANDBOX.BRONZE_GOLDEN_TICKETS src
         WHERE src._batch_id IN (SELECT batch_id FROM MCP_DB.SIGNAL_SANDBOX.STREAM_BATCH_QUEUE)
           AND src.example_id IS NOT NULL
@@ -1099,16 +1134,16 @@ BEGIN
                     EQUAL_NULL(removed.row_key, example_id)
                     OR EQUAL_NULL(
                         removed.row_key,
-                        SHA2('bronze_golden_tickets' || CHR(31) || COALESCE(_batch_id, '') || CHR(31) || IFF(example_id IS NULL, '0', '1' || example_id), 256)
+                        @@ROWKEY bronze_golden_tickets@@
                     )
                 )
           )
     ) s
     ON EQUAL_NULL(t.example_id, s.example_id)
     WHEN NOT MATCHED THEN INSERT (
-        example_id, text_redacted, topic, sentiment, severity, product_area, _loaded_at, _batch_id
+        example_id, text_redacted, topic, sentiment, severity, product_area, _loaded_at, _batch_id, row_key
     ) VALUES (
-        s.example_id, s.text_redacted, s.topic, s.sentiment, s.severity, s.product_area, :v_loaded, s._batch_id
+        s.example_id, s.text_redacted, s.topic, s.sentiment, s.severity, s.product_area, :v_loaded, s._batch_id, s.row_key
     );
 
     INSERT INTO MCP_DB.SIGNAL_SANDBOX.SILVER_REJECTS (
@@ -1128,7 +1163,8 @@ BEGIN
     MERGE INTO MCP_DB.SIGNAL_SANDBOX.SILVER_EXTERNAL_EVENTS t
     USING (
         SELECT event_id, case_id, title, summary, source_url, source_type, relevance,
-               observed_at, metric, provider, _batch_id
+               observed_at, metric, provider, _batch_id,
+               @@ROWKEY bronze_external_events@@ AS row_key
         FROM (
             SELECT
                 event_id, case_id, title, summary, source_url, source_type, relevance,
@@ -1147,7 +1183,7 @@ BEGIN
                         EQUAL_NULL(removed.row_key, src.event_id)
                         OR EQUAL_NULL(
                             removed.row_key,
-                            SHA2('bronze_external_events' || CHR(31) || COALESCE(src._batch_id, '') || CHR(31) || IFF(src.event_id IS NULL, '0', '1' || src.event_id), 256)
+                            @@ROWKEY bronze_external_events src@@
                         )
                     )
               )
@@ -1157,10 +1193,10 @@ BEGIN
     ON EQUAL_NULL(t.event_id, s.event_id)
     WHEN NOT MATCHED THEN INSERT (
         event_id, case_id, title, summary, source_url, source_type, relevance,
-        observed_at, metric, provider, _loaded_at, _batch_id
+        observed_at, metric, provider, _loaded_at, _batch_id, row_key
     ) VALUES (
         s.event_id, s.case_id, s.title, s.summary, s.source_url, s.source_type, s.relevance,
-        s.observed_at, s.metric, s.provider, :v_loaded, s._batch_id
+        s.observed_at, s.metric, s.provider, :v_loaded, s._batch_id, s.row_key
     );
 
     INSERT INTO MCP_DB.SIGNAL_SANDBOX.SILVER_REJECTS (
@@ -1555,21 +1591,43 @@ BEGIN
       );
 
     UPDATE MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS
-    SET row_key = SHA2(
-        'bronze_groups' || CHR(31) || COALESCE(_batch_id, '') || CHR(31) ||
-        IFF(group_id IS NULL, '0', '1' || group_id) || CHR(31) ||
-        IFF(hour IS NULL, '0', '1' || TO_VARCHAR(hour, 'YYYY-MM-DD HH24:MI:SS')) || CHR(31) ||
-        IFF(platform IS NULL, '0', '1' || platform) || CHR(31) ||
-        IFF(country IS NULL, '0', '1' || country) || CHR(31) ||
-        IFF(channel IS NULL, '0', '1' || channel) || CHR(31) ||
-        IFF(payment_method IS NULL, '0', '1' || payment_method) || CHR(31) ||
-        IFF(sku IS NULL, '0', '1' || sku) || CHR(31) ||
-        IFF(app_version IS NULL, '0', '1' || app_version) || CHR(31) ||
-        IFF(n_sessions IS NULL, '0', '1' || TO_VARCHAR(n_sessions)) || CHR(31) ||
-        IFF(n_convert IS NULL, '0', '1' || TO_VARCHAR(n_convert)) || CHR(31) ||
-        IFF(n_attempt IS NULL, '0', '1' || TO_VARCHAR(n_attempt)),
-        256
-    )
+    SET dq_status = 'suspect',
+        dq_reason = CASE
+            WHEN platform NOT IN (@@ALLOWED_PLATFORMS@@) THEN 'invalid_platform'
+            WHEN country NOT IN (@@ALLOWED_COUNTRIES@@) THEN 'invalid_country'
+            ELSE dq_reason
+        END
+    WHERE _batch_id = :v_batch
+      AND COALESCE(dq_status, 'ok') <> 'suspect'
+      AND platform IS NOT NULL
+      AND country IS NOT NULL
+      AND platform <> ''
+      AND country <> ''
+      AND (
+          platform NOT IN (@@ALLOWED_PLATFORMS@@)
+          OR country NOT IN (@@ALLOWED_COUNTRIES@@)
+      );
+
+    UPDATE MCP_DB.SIGNAL_SANDBOX.SILVER_SUPPORT_TICKETS
+    SET dq_status = 'suspect',
+        dq_reason = CASE
+            WHEN platform NOT IN (@@ALLOWED_PLATFORMS@@) THEN 'invalid_platform'
+            WHEN country NOT IN (@@ALLOWED_COUNTRIES@@) THEN 'invalid_country'
+            ELSE dq_reason
+        END
+    WHERE _batch_id = :v_batch
+      AND COALESCE(dq_status, 'ok') <> 'suspect'
+      AND platform IS NOT NULL
+      AND country IS NOT NULL
+      AND platform <> ''
+      AND country <> ''
+      AND (
+          platform NOT IN (@@ALLOWED_PLATFORMS@@)
+          OR country NOT IN (@@ALLOWED_COUNTRIES@@)
+      );
+
+    UPDATE MCP_DB.SIGNAL_SANDBOX.SILVER_GROUPS
+    SET row_key = @@ROWKEY bronze_groups@@
     WHERE _batch_id = :v_batch
       AND row_key IS NULL;
 
@@ -1593,37 +1651,37 @@ BEGIN
         WHERE _batch_id = :v_batch AND dq_status = 'suspect' AND row_key IS NOT NULL
         UNION ALL
         SELECT 'bronze_support_tickets',
-               COALESCE(row_key, SHA2('bronze_support_tickets' || CHR(31) || COALESCE(_batch_id, '') || CHR(31) || IFF(ticket_id IS NULL, '0', '1' || ticket_id) || CHR(31) || IFF(ts IS NULL, '0', '1' || TO_VARCHAR(ts, 'YYYY-MM-DD HH24:MI:SS')) || CHR(31) || IFF(text_redacted IS NULL, '0', '1' || text_redacted), 256)),
+               COALESCE(row_key, @@ROWKEY bronze_support_tickets@@),
                '{"ticket_id":"' || COALESCE(ticket_id, '') || '"}', dq_reason
         FROM MCP_DB.SIGNAL_SANDBOX.SILVER_SUPPORT_TICKETS
         WHERE _batch_id = :v_batch AND dq_status = 'suspect'
         UNION ALL
         SELECT 'bronze_deploys',
-               COALESCE(row_key, SHA2('bronze_deploys' || CHR(31) || COALESCE(_batch_id, '') || CHR(31) || IFF(deploy_id IS NULL, '0', '1' || deploy_id), 256)),
+               COALESCE(row_key, @@ROWKEY bronze_deploys@@),
                '{"deploy_id":"' || COALESCE(deploy_id, '') || '"}', dq_reason
         FROM MCP_DB.SIGNAL_SANDBOX.SILVER_DEPLOYS
         WHERE _batch_id = :v_batch AND dq_status = 'suspect'
         UNION ALL
         SELECT 'bronze_demo_meta',
-               COALESCE(row_key, SHA2('bronze_demo_meta' || CHR(31) || COALESCE(_batch_id, '') || CHR(31) || IFF(key IS NULL, '0', '1' || key) || CHR(31) || IFF(value IS NULL, '0', '1' || value), 256)),
+               COALESCE(row_key, @@ROWKEY bronze_demo_meta@@),
                '{"key":"' || COALESCE(key, '') || '"}', dq_reason
         FROM MCP_DB.SIGNAL_SANDBOX.SILVER_DEMO_META
         WHERE _batch_id = :v_batch AND dq_status = 'suspect'
         UNION ALL
         SELECT 'bronze_golden_tickets',
-               COALESCE(row_key, SHA2('bronze_golden_tickets' || CHR(31) || COALESCE(_batch_id, '') || CHR(31) || IFF(example_id IS NULL, '0', '1' || example_id), 256)),
+               COALESCE(row_key, @@ROWKEY bronze_golden_tickets@@),
                '{"example_id":"' || COALESCE(example_id, '') || '"}', dq_reason
         FROM MCP_DB.SIGNAL_SANDBOX.SILVER_GOLDEN_TICKETS
         WHERE _batch_id = :v_batch AND dq_status = 'suspect'
         UNION ALL
         SELECT 'bronze_external_events',
-               COALESCE(row_key, SHA2('bronze_external_events' || CHR(31) || COALESCE(_batch_id, '') || CHR(31) || IFF(event_id IS NULL, '0', '1' || event_id), 256)),
+               COALESCE(row_key, @@ROWKEY bronze_external_events@@),
                '{"event_id":"' || COALESCE(event_id, '') || '"}', dq_reason
         FROM MCP_DB.SIGNAL_SANDBOX.SILVER_EXTERNAL_EVENTS
         WHERE _batch_id = :v_batch AND dq_status = 'suspect'
         UNION ALL
         SELECT 'silver_spend',
-               COALESCE(row_key, SHA2('silver_spend' || CHR(31) || COALESCE(_batch_id, '') || CHR(31) || IFF(logged_at IS NULL, '0', '1' || TO_VARCHAR(logged_at, 'YYYY-MM-DD HH24:MI:SS')) || CHR(31) || IFF(case_id IS NULL, '0', '1' || case_id) || CHR(31) || IFF(kind IS NULL, '0', '1' || kind), 256)),
+               COALESCE(row_key, @@ROWKEY silver_spend@@),
                '{"case_id":"' || COALESCE(case_id, '') || '"}', dq_reason
         FROM MCP_DB.SIGNAL_SANDBOX.SILVER_SPEND
         WHERE _batch_id = :v_batch AND dq_status = 'suspect'
@@ -1816,16 +1874,20 @@ $$;
 
 -- @section task
 
--- Triggered tasks. SCHEDULE is omitted on purpose. The WHEN clause is the
--- trigger. TARGET_COMPLETION_INTERVAL is the serverless completion target
--- (required when WAREHOUSE is omitted). It is not a poll interval.
--- OVERLAP_POLICY = NO_OVERLAP keeps a single run at a time
--- (ALLOW_OVERLAPPING_EXECUTION = FALSE). No account parameter is set.
+-- User-managed triggered tasks. SCHEDULE is omitted on purpose. The WHEN
+-- clause is the trigger. WAREHOUSE = COMPUTE_WH supplies the compute.
+-- TARGET_COMPLETION_INTERVAL and USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE are
+-- serverless-only and are not set. OVERLAP_POLICY = NO_OVERLAP keeps a single
+-- run at a time (ALLOW_OVERLAPPING_EXECUTION = FALSE). No account parameter
+-- is set. This file does not create or alter the warehouse.
+--
+-- TASK_SILVER_TO_GOLD calls LOAD_STAGING(NULL) on purpose. That procedure is
+-- the gold build: it writes GOLD_HOURLY_CONVERSION, GOLD_REVENUE_AT_RISK, and
+-- GOLD_DAILY_SPEND after silver. The task stays one statement.
 
 CREATE OR REPLACE TASK MCP_DB.SIGNAL_SANDBOX.TASK_BRONZE_TO_SILVER
-    USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = 'XSMALL'
+    WAREHOUSE = COMPUTE_WH
     OVERLAP_POLICY = NO_OVERLAP
-    TARGET_COMPLETION_INTERVAL = '1 MINUTE'
     WHEN SYSTEM$STREAM_HAS_DATA('MCP_DB.SIGNAL_SANDBOX.STREAM_BRONZE_GROUPS')
       OR SYSTEM$STREAM_HAS_DATA('MCP_DB.SIGNAL_SANDBOX.STREAM_BRONZE_SUPPORT_TICKETS')
       OR SYSTEM$STREAM_HAS_DATA('MCP_DB.SIGNAL_SANDBOX.STREAM_BRONZE_DEPLOYS')
@@ -1836,9 +1898,8 @@ AS
     CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(NULL);
 
 CREATE OR REPLACE TASK MCP_DB.SIGNAL_SANDBOX.TASK_SILVER_TO_GOLD
-    USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE = 'XSMALL'
+    WAREHOUSE = COMPUTE_WH
     OVERLAP_POLICY = NO_OVERLAP
-    TARGET_COMPLETION_INTERVAL = '1 MINUTE'
     WHEN SYSTEM$STREAM_HAS_DATA('MCP_DB.SIGNAL_SANDBOX.STREAM_SILVER_GROUPS')
 AS
     CALL MCP_DB.SIGNAL_SANDBOX.LOAD_STAGING(NULL);

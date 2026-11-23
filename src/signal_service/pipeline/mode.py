@@ -99,15 +99,19 @@ def install_event_driven(warehouse) -> ModeReport:
             ) from exc
     tasks_ok = False
     if streams_ok and procedure_ok:
-        task_statements = medallion_statements("task")
-        tasks_ok = bool(task_statements)
-        for statement in task_statements:
-            if not _try(warehouse, statement, missing, errors):
-                tasks_ok = False
-        if tasks_ok:
-            for statement in medallion_statements("resume"):
-                if not _try(warehouse, statement, missing, errors):
-                    tasks_ok = False
+        try:
+            align_user_managed_tasks(warehouse)
+            tasks_ok = True
+        except WarehouseUsageError:
+            raise
+        except Exception as exc:
+            usage = warehouse_usage_denial(exc)
+            if usage:
+                raise WarehouseUsageError(usage) from exc
+            if is_privilege_denial(exc):
+                missing.append("CREATE TASK")
+            errors.append(f"CREATE TASK: {str(exc)[:240]}")
+            tasks_ok = False
     elif not streams_ok:
         notes.append("Tasks were not created because a stream could not be created.")
     dynamic = False
@@ -131,6 +135,165 @@ def install_event_driven(warehouse) -> ModeReport:
         procedure_ready=procedure_ok,
         tasks_ready=tasks_ok,
     )
+
+
+TASK_WAREHOUSE = "COMPUTE_WH"
+# Suspend the producer first. Resume the consumer first so it is ready
+# before bronze starts landing new silver rows.
+SUSPEND_ORDER = ("TASK_BRONZE_TO_SILVER", "TASK_SILVER_TO_GOLD")
+RESUME_ORDER = ("TASK_SILVER_TO_GOLD", "TASK_BRONZE_TO_SILVER")
+_SERVERLESS_PARAMS = (
+    "USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE",
+    "TARGET_COMPLETION_INTERVAL",
+)
+_BRONZE_STREAMS = (
+    "STREAM_BRONZE_GROUPS",
+    "STREAM_BRONZE_SUPPORT_TICKETS",
+    "STREAM_BRONZE_DEPLOYS",
+    "STREAM_BRONZE_DEMO_META",
+    "STREAM_BRONZE_GOLDEN_TICKETS",
+    "STREAM_BRONZE_EXTERNAL_EVENTS",
+)
+
+
+class WarehouseUsageError(RuntimeError):
+    """The deploying role cannot use COMPUTE_WH. Deploy stops."""
+
+
+def warehouse_usage_denial(exc: BaseException) -> str | None:
+    """A task statement failed because COMPUTE_WH is not usable."""
+    text = str(exc).lower()
+    if "compute_wh" not in text:
+        return None
+    if not any(token in text for token in ("privilege", "not authorized", "usage", "does not exist", "access control")):
+        return None
+    return (
+        "The deploying role lacks USAGE on warehouse COMPUTE_WH. "
+        "Deploy does not create or alter the warehouse and does not change grants. "
+        f"{exc}"
+    )
+
+
+def align_user_managed_tasks(warehouse, *, sandbox: str = SANDBOX_QUALIFIED) -> None:
+    """Point both triggered tasks at COMPUTE_WH.
+
+    Existing tasks are suspended, given the warehouse, and stripped of the
+    serverless parameters only when those parameters are set. New tasks are
+    created with ``WAREHOUSE = COMPUTE_WH`` and no schedule. Resume runs the
+    silver task before the bronze task. ``SHOW TASKS`` must then show
+    ``COMPUTE_WH``, a null schedule, and a stream condition.
+
+    ``USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE`` cannot stay set once a
+    warehouse is assigned, so that parameter is cleared before
+    ``SET WAREHOUSE``. ``TARGET_COMPLETION_INTERVAL`` is cleared after.
+    """
+    if getattr(warehouse, "query", None) is None:
+        for statement in medallion_statements("task"):
+            warehouse.execute(statement)
+        for statement in medallion_statements("resume"):
+            warehouse.execute(statement)
+        return
+    _assert_compute_warehouse(warehouse)
+    existing = _tasks_by_name(warehouse, sandbox)
+    for name in SUSPEND_ORDER:
+        if name not in existing:
+            continue
+        warehouse.execute(f"ALTER TASK {sandbox}.{name} SUSPEND")
+        set_params = _parameters_set_on_task(warehouse, sandbox, name)
+        # Snowflake rejects WAREHOUSE together with the managed size.
+        if "USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE" in set_params:
+            warehouse.execute(
+                f"ALTER TASK {sandbox}.{name} UNSET USER_TASK_MANAGED_INITIAL_WAREHOUSE_SIZE"
+            )
+        warehouse.execute(f"ALTER TASK {sandbox}.{name} SET WAREHOUSE = {TASK_WAREHOUSE}")
+        if "TARGET_COMPLETION_INTERVAL" in set_params:
+            warehouse.execute(f"ALTER TASK {sandbox}.{name} UNSET TARGET_COMPLETION_INTERVAL")
+    for statement in medallion_statements("task"):
+        warehouse.execute(statement)
+    for statement in medallion_statements("resume"):
+        warehouse.execute(statement)
+    shown = _tasks_by_name(warehouse, sandbox)
+    errors = task_shape_errors(list(shown.values()))
+    if errors:
+        raise RuntimeError("SHOW TASKS verification failed: " + "; ".join(errors))
+
+
+def task_shape_errors(rows: list[dict]) -> list[str]:
+    """Checks a ``SHOW TASKS`` result for the user-managed triggered shape."""
+    by_name = {}
+    for row in rows:
+        name = str(row.get("name") or "").upper()
+        if name:
+            by_name[name] = {str(key).lower(): value for key, value in row.items()}
+    errors: list[str] = []
+    expected_condition = {
+        "TASK_BRONZE_TO_SILVER": _BRONZE_STREAMS,
+        "TASK_SILVER_TO_GOLD": ("STREAM_SILVER_GROUPS",),
+    }
+    for name, streams in expected_condition.items():
+        row = by_name.get(name)
+        if row is None:
+            errors.append(f"{name} is missing from SHOW TASKS")
+            continue
+        warehouse = str(row.get("warehouse") or "").upper()
+        if warehouse != TASK_WAREHOUSE:
+            errors.append(f"{name} warehouse is {warehouse or 'NULL'}, expected {TASK_WAREHOUSE}")
+        schedule = row.get("schedule")
+        if schedule not in (None, ""):
+            errors.append(f"{name} schedule is {schedule}, expected NULL")
+        condition = str(row.get("condition") or "")
+        folded = condition.upper()
+        if "SYSTEM$STREAM_HAS_DATA" not in folded:
+            errors.append(f"{name} condition is not set")
+        for stream in streams:
+            if stream not in folded:
+                errors.append(f"{name} condition does not include {stream}")
+        definition = str(row.get("definition") or "").upper().replace(" ", "")
+        if "LOAD_STAGING(NULL)" not in definition:
+            errors.append(f"{name} definition does not call LOAD_STAGING(NULL)")
+        interval = row.get("target_completion_interval")
+        if interval not in (None, ""):
+            errors.append(f"{name} target_completion_interval is still set")
+    return errors
+
+
+def _assert_compute_warehouse(warehouse) -> None:
+    rows = warehouse.query("SHOW WAREHOUSES LIKE 'COMPUTE_WH'")
+    names = set()
+    for row in rows:
+        lowered = {str(key).lower(): value for key, value in row.items()}
+        names.add(str(lowered.get("name") or "").upper())
+    if TASK_WAREHOUSE not in names:
+        raise WarehouseUsageError(
+            "The deploying role lacks USAGE on warehouse COMPUTE_WH. "
+            "Deploy does not create or alter the warehouse and does not change grants."
+        )
+
+
+def _tasks_by_name(warehouse, sandbox: str) -> dict[str, dict]:
+    rows = warehouse.query(f"SHOW TASKS IN SCHEMA {sandbox}")
+    found: dict[str, dict] = {}
+    for row in rows:
+        lowered = {str(key).lower(): value for key, value in row.items()}
+        name = str(lowered.get("name") or "").upper()
+        if name in RESUME_ORDER or name in SUSPEND_ORDER:
+            found[name] = lowered
+    return found
+
+
+def _parameters_set_on_task(warehouse, sandbox: str, name: str) -> set[str]:
+    rows = warehouse.query(f"SHOW PARAMETERS IN TASK {sandbox}.{name}")
+    set_on_task: set[str] = set()
+    for row in rows:
+        lowered = {str(key).lower(): value for key, value in row.items()}
+        key = str(lowered.get("key") or "").upper()
+        if key not in _SERVERLESS_PARAMS:
+            continue
+        level = str(lowered.get("level") or "").upper()
+        value = lowered.get("value")
+        if level == "TASK" and value not in (None, ""):
+            set_on_task.add(key)
+    return set_on_task
 
 
 def dynamic_table_sql(warehouse_name: str, *, sandbox: str = SANDBOX_QUALIFIED) -> str:
